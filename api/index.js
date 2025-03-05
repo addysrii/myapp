@@ -8767,6 +8767,47 @@ app.post('/api/posts/:postId/react', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error updating post reaction' });
   }
 });
+// Add this to your server.js file
+
+// Get posts (paginated)
+app.get('/api/posts', authenticateToken, async (req, res) => {
+  try {
+    const { limit = 10, before, after } = req.query;
+    
+    // Build query
+    let query = {};
+    
+    if (before) {
+      query.createdAt = { $lt: new Date(before) };
+    }
+    
+    if (after) {
+      query.createdAt = { $gt: new Date(after) };
+    }
+    
+    // Apply privacy filter
+    const user = await User.findById(req.user.id);
+    query.$or = [
+      { visibility: 'public' },
+      { visibility: 'connections', author: { $in: user.connections || [] } },
+      { author: req.user.id }
+    ];
+    
+    // Execute query with sorting and pagination
+    const posts = await Post.find(query)
+      .populate('author', 'firstName lastName profilePicture headline')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit));
+    
+    res.json({
+      posts,
+      hasMore: posts.length === parseInt(limit)
+    });
+  } catch (error) {
+    console.error('Get posts error:', error);
+    res.status(500).json({ error: 'Error fetching posts' });
+  }
+});
 // ----------------------
 // DISCOVERY SYSTEM ROUTES
 // ----------------------
@@ -9501,6 +9542,123 @@ app.get('/api/profile-views/activity', authenticateToken, async (req, res) => {
 // ----------------------
 
 // Project Routes
+// Add these routes to your server.js file
+
+// Project routes with query parameter filtering
+app.get('/api/projects', authenticateToken, async (req, res) => {
+  try {
+    const { userId, limit = 10, page = 1 } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build the query
+    let query = {};
+    
+    // Filter by user if provided
+    if (userId) {
+      query.user = userId;
+    }
+    
+    // Execute the query with pagination
+    const projects = await Project.find(query)
+      .sort({ updatedAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count for pagination
+    const total = await Project.countDocuments(query);
+    
+    res.json({
+      items: projects,
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      pages: Math.ceil(total / parseInt(limit))
+    });
+  } catch (error) {
+    console.error('Get projects error:', error);
+    res.status(500).json({ error: 'Error fetching projects' });
+  }
+});
+
+// Achievement routes with query parameter filtering
+app.get('/api/achievements', authenticateToken, async (req, res) => {
+  try {
+    const { userId, limit = 10, page = 1 } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build the query
+    let query = {};
+    
+    // Filter by user if provided
+    if (userId) {
+      query.user = userId;
+    }
+    
+    // Execute the query with pagination
+    const achievements = await Achievement.find(query)
+      .sort({ featured: -1, dateAchieved: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count for pagination
+    const total = await Achievement.countDocuments(query);
+    
+    res.json({
+      items: achievements,
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      pages: Math.ceil(total / parseInt(limit))
+    });
+  } catch (error) {
+    console.error('Get achievements error:', error);
+    res.status(500).json({ error: 'Error fetching achievements' });
+  }
+});
+
+// Streak routes with query parameter filtering
+app.get('/api/streaks', authenticateToken, async (req, res) => {
+  try {
+    const { userId, limit = 10, page = 1, active } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build the query
+    let query = {};
+    
+    // Filter by user if provided
+    if (userId) {
+      query.user = userId;
+    }
+    
+    // Filter by active status if provided
+    if (active !== undefined) {
+      query.active = active === 'true';
+    }
+    
+    // Execute the query with pagination
+    const streaks = await Streak.find(query)
+      .sort({ currentStreak: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count for pagination
+    const total = await Streak.countDocuments(query);
+    
+    res.json({
+      items: streaks,
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      pages: Math.ceil(total / parseInt(limit))
+    });
+  } catch (error) {
+    console.error('Get streaks error:', error);
+    res.status(500).json({ error: 'Error fetching streaks' });
+  }
+});
 app.post('/api/projects', authenticateToken, upload.array('attachments', 5), async (req, res) => {
   try {
     console.log('==== PROJECT CREATION REQUEST ====');
@@ -9616,6 +9774,447 @@ app.post('/api/projects', authenticateToken, upload.array('attachments', 5), asy
       error: 'Error creating project', 
       message: error.message 
     });
+  }
+});
+// PROJECT ENDPOINTS
+// -----------------
+
+// Delete a project
+app.delete('/api/projects/:projectId', authenticateToken, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.projectId);
+    
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    
+    // Ensure the user owns this project
+    if (project.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to delete this project' });
+    }
+    
+    await Project.findByIdAndDelete(req.params.projectId);
+    
+    res.json({ success: true, message: 'Project deleted successfully' });
+  } catch (error) {
+    console.error('Delete project error:', error);
+    res.status(500).json({ error: 'Error deleting project' });
+  }
+});
+
+// Update a project
+app.put('/api/projects/:projectId', authenticateToken, upload.array('attachments', 5), async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    
+    // First check if project exists and belongs to user
+    const existingProject = await Project.findById(projectId);
+    
+    if (!existingProject) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    
+    if (existingProject.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to update this project' });
+    }
+    
+    // Get project data from request
+    let { 
+      title, description, category, tags, status,
+      startDate, endDate, collaborators, links,
+      milestones, visibility 
+    } = req.body;
+    
+    // Also check if projectData was sent separately
+    if (req.body.projectData) {
+      try {
+        const projectData = JSON.parse(req.body.projectData);
+        // Extract fields from the parsed JSON
+        ({ 
+          title, description, category, tags, status,
+          startDate, endDate, collaborators, links,
+          milestones, visibility 
+        } = projectData);
+      } catch (e) {
+        console.error('Error parsing projectData:', e);
+      }
+    }
+    
+    // Process uploaded files if any
+    let attachments = [];
+    if (req.files && req.files.length > 0) {
+      attachments = req.files.map(file => ({
+        title: file.originalname,
+        fileUrl: file.path,
+        fileType: file.mimetype
+      }));
+    }
+    
+    // Prepare update data
+    const updateData = {
+      title: title || existingProject.title,
+      description: description || existingProject.description,
+      category: category || existingProject.category,
+      status: status || existingProject.status,
+      visibility: visibility || existingProject.visibility
+    };
+    
+    // Add optional fields if they exist
+    if (startDate) updateData.startDate = new Date(startDate);
+    if (endDate) updateData.endDate = new Date(endDate);
+    if (tags) updateData.tags = typeof tags === 'string' ? tags.split(',') : tags;
+    
+    if (collaborators) {
+      updateData.collaborators = typeof collaborators === 'string' 
+        ? JSON.parse(collaborators) 
+        : collaborators;
+    }
+    
+    if (links) {
+      updateData.links = typeof links === 'string' 
+        ? JSON.parse(links) 
+        : links;
+    }
+    
+    if (milestones) {
+      updateData.milestones = typeof milestones === 'string' 
+        ? JSON.parse(milestones) 
+        : milestones;
+    }
+    
+    // Only add new attachments if provided
+    if (attachments.length > 0) {
+      updateData.attachments = [...(existingProject.attachments || []), ...attachments];
+    }
+    
+    // Update the project
+    const updatedProject = await Project.findByIdAndUpdate(
+      projectId,
+      updateData,
+      { new: true }
+    );
+    
+    res.json(updatedProject);
+  } catch (error) {
+    console.error('Update project error:', error);
+    res.status(500).json({ error: 'Error updating project' });
+  }
+});
+
+// Get a specific project
+app.get('/api/projects/:projectId', authenticateToken, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.projectId);
+    
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    
+    // Check if user has permission to view this project
+    if (project.visibility === 'private' && project.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to view this project' });
+    }
+    
+    res.json(project);
+  } catch (error) {
+    console.error('Get project error:', error);
+    res.status(500).json({ error: 'Error fetching project' });
+  }
+});
+
+// ACHIEVEMENT ENDPOINTS
+// --------------------
+
+// Delete an achievement
+app.delete('/api/achievements/:achievementId', authenticateToken, async (req, res) => {
+  try {
+    const achievement = await Achievement.findById(req.params.achievementId);
+    
+    if (!achievement) {
+      return res.status(404).json({ error: 'Achievement not found' });
+    }
+    
+    // Ensure the user owns this achievement
+    if (achievement.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to delete this achievement' });
+    }
+    
+    await Achievement.findByIdAndDelete(req.params.achievementId);
+    
+    res.json({ success: true, message: 'Achievement deleted successfully' });
+  } catch (error) {
+    console.error('Delete achievement error:', error);
+    res.status(500).json({ error: 'Error deleting achievement' });
+  }
+});
+
+// Update an achievement
+app.put('/api/achievements/:achievementId', authenticateToken, upload.single('image'), async (req, res) => {
+  try {
+    const achievementId = req.params.achievementId;
+    
+    // First check if achievement exists and belongs to user
+    const existingAchievement = await Achievement.findById(achievementId);
+    
+    if (!existingAchievement) {
+      return res.status(404).json({ error: 'Achievement not found' });
+    }
+    
+    if (existingAchievement.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to update this achievement' });
+    }
+    
+    // Get achievement data from request
+    const {
+      title, description, category, dateAchieved,
+      issuer, certificateUrl, verificationUrl, 
+      expirationDate, visibility, featured
+    } = req.body;
+    
+    // Prepare update data
+    const updateData = {};
+    
+    if (title) updateData.title = title;
+    if (description) updateData.description = description;
+    if (category) updateData.category = category;
+    if (dateAchieved) updateData.dateAchieved = new Date(dateAchieved);
+    if (issuer) updateData.issuer = issuer;
+    if (certificateUrl) updateData.certificateUrl = certificateUrl;
+    if (verificationUrl) updateData.verificationUrl = verificationUrl;
+    if (expirationDate) updateData.expirationDate = new Date(expirationDate);
+    if (visibility) updateData.visibility = visibility;
+    if (featured !== undefined) updateData.featured = featured === 'true' || featured === true;
+    
+    // Add new image if provided
+    if (req.file) {
+      updateData.image = req.file.path;
+    }
+    
+    // Update the achievement
+    const updatedAchievement = await Achievement.findByIdAndUpdate(
+      achievementId,
+      updateData,
+      { new: true }
+    );
+    
+    res.json(updatedAchievement);
+  } catch (error) {
+    console.error('Update achievement error:', error);
+    res.status(500).json({ error: 'Error updating achievement' });
+  }
+});
+
+// Get a specific achievement
+app.get('/api/achievements/:achievementId', authenticateToken, async (req, res) => {
+  try {
+    const achievement = await Achievement.findById(req.params.achievementId);
+    
+    if (!achievement) {
+      return res.status(404).json({ error: 'Achievement not found' });
+    }
+    
+    // Check if user has permission to view this achievement
+    if (achievement.visibility === 'private' && achievement.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to view this achievement' });
+    }
+    
+    res.json(achievement);
+  } catch (error) {
+    console.error('Get achievement error:', error);
+    res.status(500).json({ error: 'Error fetching achievement' });
+  }
+});
+
+// STREAK ENDPOINTS
+// ---------------
+
+// Delete a streak
+app.delete('/api/streaks/:streakId', authenticateToken, async (req, res) => {
+  try {
+    const streak = await Streak.findById(req.params.streakId);
+    
+    if (!streak) {
+      return res.status(404).json({ error: 'Streak not found' });
+    }
+    
+    // Ensure the user owns this streak
+    if (streak.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to delete this streak' });
+    }
+    
+    await Streak.findByIdAndDelete(req.params.streakId);
+    
+    res.json({ success: true, message: 'Streak deleted successfully' });
+  } catch (error) {
+    console.error('Delete streak error:', error);
+    res.status(500).json({ error: 'Error deleting streak' });
+  }
+});
+
+// Update a streak
+app.put('/api/streaks/:streakId', authenticateToken, async (req, res) => {
+  try {
+    const streakId = req.params.streakId;
+    
+    // First check if streak exists and belongs to user
+    const existingStreak = await Streak.findById(streakId);
+    
+    if (!existingStreak) {
+      return res.status(404).json({ error: 'Streak not found' });
+    }
+    
+    if (existingStreak.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to update this streak' });
+    }
+    
+    // Get streak data from request
+    const {
+      title, description, category, target, customFrequency,
+      activity, visibility, reminderTime
+    } = req.body;
+    
+    // Parse custom frequency if provided
+    let parsedCustomFrequency;
+    if (customFrequency) {
+      try {
+        parsedCustomFrequency = typeof customFrequency === 'string' 
+          ? JSON.parse(customFrequency) 
+          : customFrequency;
+      } catch (e) {
+        console.error('Error parsing customFrequency:', e);
+      }
+    }
+    
+    // Prepare update data
+    const updateData = {};
+    
+    if (title) updateData.title = title;
+    if (description) updateData.description = description;
+    if (category) updateData.category = category;
+    if (target) updateData.target = target;
+    if (parsedCustomFrequency) updateData.customFrequency = parsedCustomFrequency;
+    if (activity) updateData.activity = activity;
+    if (visibility) updateData.visibility = visibility;
+    if (reminderTime) updateData.reminderTime = new Date(reminderTime);
+    
+    // Update the streak
+    const updatedStreak = await Streak.findByIdAndUpdate(
+      streakId,
+      updateData,
+      { new: true }
+    );
+    
+    res.json(updatedStreak);
+  } catch (error) {
+    console.error('Update streak error:', error);
+    res.status(500).json({ error: 'Error updating streak' });
+  }
+});
+
+// Get a specific streak
+app.get('/api/streaks/:streakId', authenticateToken, async (req, res) => {
+  try {
+    const streak = await Streak.findById(req.params.streakId);
+    
+    if (!streak) {
+      return res.status(404).json({ error: 'Streak not found' });
+    }
+    
+    // Check if user has permission to view this streak
+    if (streak.visibility === 'private' && streak.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to view this streak' });
+    }
+    
+    res.json(streak);
+  } catch (error) {
+    console.error('Get streak error:', error);
+    res.status(500).json({ error: 'Error fetching streak' });
+  }
+});
+
+// Check in to a streak
+app.post('/api/streaks/:streakId/checkin', authenticateToken, upload.single('evidence'), async (req, res) => {
+  try {
+    const { notes } = req.body;
+    const streakId = req.params.streakId;
+    
+    // Find the streak
+    const streak = await Streak.findById(streakId);
+    
+    if (!streak) {
+      return res.status(404).json({ error: 'Streak not found' });
+    }
+    
+    // Ensure the user owns this streak
+    if (streak.user.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to check in to this streak' });
+    }
+    
+    // Check if already checked in today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const todayCheckIn = streak.checkIns.find(checkIn => {
+      const checkInDate = new Date(checkIn.date);
+      checkInDate.setHours(0, 0, 0, 0);
+      return checkInDate.getTime() === today.getTime();
+    });
+    
+    if (todayCheckIn) {
+      return res.status(400).json({ error: 'Already checked in today' });
+    }
+    
+    // Get evidence file if uploaded
+    const evidenceUrl = req.file ? req.file.path : null;
+    
+    // Add check-in
+    streak.checkIns.push({
+      date: new Date(),
+      completed: true,
+      notes: notes || '',
+      evidence: evidenceUrl
+    });
+    
+    // Update streak calculations
+    const lastCheckIn = streak.checkIns.length > 1 
+      ? streak.checkIns[streak.checkIns.length - 2] 
+      : null;
+    
+    if (lastCheckIn) {
+      const lastCheckInDate = new Date(lastCheckIn.date);
+      const todayDate = new Date();
+      
+      // Calculate days difference
+      const timeDiff = Math.abs(todayDate.getTime() - lastCheckInDate.getTime());
+      const dayDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
+      
+      if (dayDiff <= 1) {
+        // Consecutive day, increment streak
+        streak.currentStreak += 1;
+      } else {
+        // Streak broken, reset
+        streak.currentStreak = 1;
+      }
+    } else {
+      // First check-in
+      streak.currentStreak = 1;
+    }
+    
+    // Update longest streak if needed
+    if (streak.currentStreak > streak.longestStreak) {
+      streak.longestStreak = streak.currentStreak;
+    }
+    
+    // Increment total completions
+    streak.totalCompletions += 1;
+    
+    // Save the updated streak
+    await streak.save();
+    
+    res.json(streak);
+  } catch (error) {
+    console.error('Streak check-in error:', error);
+    res.status(500).json({ error: 'Error checking in to streak' });
   }
 });
 // Streak Routes
