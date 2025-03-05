@@ -10378,7 +10378,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/professio
 const io = new Server(server, {
   cors: {
     origin: [
-      'http://localhost:5173',   // Development frontend URL
+      'https://appy-coral.vercel.app/',   // Development frontend URL
       'http://localhost:3000',   // If your backend is also serving frontend
       /\.yourdomain\.com$/       // Production domain pattern
     ],
