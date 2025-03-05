@@ -2,10 +2,12 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const mongoose = require('mongoose');
 const passport = require('passport');
+const path = require('path');
 const http = require('http');
 const LocalStrategy = require('passport-local').Strategy;
 const { Server } = require('socket.io');
 const session = require('express-session');
+const fs = require('fs');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -29,7 +31,7 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || `https://myapp-uc9m.onrender.com`;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 app.use(cors({
   origin: 'http://localhost:5173', // Your frontend URL
   credentials: true
@@ -48,6 +50,7 @@ cloudinary.config({
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
+app.use(express.json()); // Ensure this is enabled
 
 // Auth provider credentials
 const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
@@ -88,6 +91,40 @@ const storage = new CloudinaryStorage({
 });
 
 const upload = multer({ storage: storage });
+// First, define the storage
+const dpStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'dp',
+    resource_type: 'auto',
+    allowed_formats: ['jpg', 'jpeg', 'png'],
+    transformation: [
+      { quality: 'auto' }, // Automatic quality optimization
+      { fetch_format: 'auto' }  // Automatic format conversion based on browser
+    ]
+  }
+});
+
+// Then, define the upload middleware using the storage
+const dpUpload = multer({
+  storage: dpStorage,
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB file size limit
+    files: 1 // Only one file per upload
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow common image types
+    const allowedMimeTypes = [
+      'image/jpeg', 'image/png', 'image/gif'
+    ];
+    
+    if (allowedMimeTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images are allowed.'), false);
+    }
+  }
+});
 const postStorage = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
@@ -116,7 +153,45 @@ const postUpload = multer({
     }
   }
 });
+// Specific Cloudinary storage for chat attachments
+const chatAttachmentStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'chat_attachments',
+    resource_type: 'auto',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'mp4', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt'],
+    transformation: [
+      { quality: 'auto' }, // Automatic quality optimization
+      { fetch_format: 'auto' }  // Automatic format conversion based on browser
+    ]
+  }
+});
 
+// Create upload middleware specifically for chat attachments
+const chatUpload = multer({
+  storage: chatAttachmentStorage,
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB file size limit for chat attachments
+    files: 1 // Only one file per message
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow common file types
+    const allowedMimeTypes = [
+      'image/jpeg', 'image/png', 'image/gif', 
+      'video/mp4', 'video/quicktime',
+      'application/pdf', 
+      'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/plain'
+    ];
+    
+    if (allowedMimeTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images, videos, and common document formats are allowed.'), false);
+    }
+  }
+});
 // JWT Authentication Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -172,7 +247,7 @@ const messageSchema = new mongoose.Schema({
   },
   content: {
     type: String,
-    required: true
+    
   },
   read: {
     type: Boolean,
@@ -408,7 +483,35 @@ const storySchema = new mongoose.Schema({
     expires: 86400 // 24 hours in seconds
   }
 });
+// Profile View Schema
+const profileViewSchema = new mongoose.Schema({
+  profileId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  viewerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  visibility: {
+    type: String,
+    enum: ['full', 'limited', 'anonymous'],
+    default: 'full'
+  },
+  viewedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
 
+// Create indexes for better query performance
+profileViewSchema.index({ profileId: 1, viewedAt: -1 });
+profileViewSchema.index({ viewerId: 1, viewedAt: -1 });
+profileViewSchema.index({ profileId: 1, viewerId: 1, viewedAt: -1 });
+
+const ProfileView = mongoose.model('ProfileView', profileViewSchema);
 const highlightSchema = new mongoose.Schema({
   author: {
     type: mongoose.Schema.Types.ObjectId,
@@ -2658,7 +2761,7 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 // USER PROFILE ROUTES
 // ----------------------
 
-app.put('/api/profile', authenticateToken, async (req, res) => {
+app.put('/api/profile', authenticateToken, dpUpload.single('profileImage'), async (req, res) => {
   try {
     const {
       firstName,
@@ -2666,10 +2769,14 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
       headline,
       industry,
       skills,
-      profilePicture,
       password,
       currentPassword,
-      portfolio
+      portfolio,
+      socialLinks,
+      location,
+      email,
+      phoneNumber,
+      about
     } = req.body;
 
     if (firstName === '') return res.status(400).json({ error: 'First name cannot be empty' });
@@ -2683,11 +2790,35 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
 
     const updateFields = {};
     
+    // Basic fields
     if (firstName) updateFields.firstName = firstName.trim();
     if (lastName) updateFields.lastName = lastName.trim();
     if (headline) updateFields.headline = headline.trim();
     if (industry) updateFields.industry = industry.trim();
-    if (profilePicture) updateFields.profilePicture = profilePicture.trim();
+    if (email) updateFields.email = email.trim();
+    if (phoneNumber) updateFields.phoneNumber = phoneNumber.trim();
+    
+    // Handle file upload - if a file was uploaded, update the profilePicture field
+    if (req.file) {
+      // Create a URL path to the uploaded file
+      const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
+      const relativePath = path.relative(path.join(__dirname, '..'), req.file.path);
+      updateFields.profilePicture = req.file.path;
+      
+  
+      
+      // Optional: Delete the old profile picture file if it exists and isn't the default
+      if (currentUser.profilePicture && 
+          !currentUser.profilePicture.includes('default') && 
+          fs.existsSync(currentUser.profilePicture)) {
+        try {
+          fs.unlinkSync(currentUser.profilePicture);
+        } catch (err) {
+          console.error('Error deleting old profile picture:', err);
+          // Continue with the update even if deletion fails
+        }
+      }
+    }
 
     // Handle password update
     if (password) {
@@ -2713,49 +2844,122 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
       }
     }
 
-    // Handle skills update
-    if (skills && Array.isArray(skills)) {
-      updateFields.skills = skills.map(skill => 
-        typeof skill === 'object' 
-          ? { name: skill.name.trim(), endorsements: skill.endorsements || 0 }
-          : { name: skill.trim(), endorsements: 0 }
-      );
+    // Handle skills update - parse from string if needed
+    if (skills) {
+      let parsedSkills;
+      
+      // Handle skills whether it's a JSON string or already parsed
+      if (typeof skills === 'string') {
+        try {
+          parsedSkills = JSON.parse(skills);
+        } catch (e) {
+          // If it's not valid JSON, treat it as a comma-separated string
+          parsedSkills = skills.split(',').map(s => s.trim()).filter(s => s);
+        }
+      } else {
+        parsedSkills = skills;
+      }
+      
+      // Convert to the expected format
+      if (Array.isArray(parsedSkills)) {
+        updateFields.skills = parsedSkills.map(skill => 
+          typeof skill === 'object' 
+            ? { name: skill.name.trim(), endorsements: skill.endorsements || 0 }
+            : { name: skill.trim(), endorsements: 0 }
+        );
+      }
+    }
+    
+    // Handle location update
+    if (location) {
+      let parsedLocation;
+      
+      // Parse location if it's a string
+      if (typeof location === 'string') {
+        try {
+          parsedLocation = JSON.parse(location);
+        } catch (e) {
+          parsedLocation = { address: location.trim() };
+        }
+      } else {
+        parsedLocation = location;
+      }
+      
+      // Update location fields
+      if (parsedLocation.address) updateFields['location.address'] = parsedLocation.address.trim();
+      if (parsedLocation.city) updateFields['location.city'] = parsedLocation.city.trim();
+      if (parsedLocation.state) updateFields['location.state'] = parsedLocation.state.trim();
+      if (parsedLocation.country) updateFields['location.country'] = parsedLocation.country.trim();
+    }
+    
+    // Handle social links update
+    if (socialLinks) {
+      let parsedLinks;
+      
+      // Parse social links if it's a string
+      if (typeof socialLinks === 'string') {
+        try {
+          parsedLinks = JSON.parse(socialLinks);
+        } catch (e) {
+          parsedLinks = {};
+        }
+      } else {
+        parsedLinks = socialLinks;
+      }
+      
+      // Update social link fields
+      if (parsedLinks.linkedin) updateFields['socialLinks.linkedin'] = parsedLinks.linkedin.trim();
+      if (parsedLinks.twitter) updateFields['socialLinks.twitter'] = parsedLinks.twitter.trim();
+      if (parsedLinks.website) updateFields['socialLinks.website'] = parsedLinks.website.trim();
     }
     
     // Handle portfolio update
     if (portfolio) {
+      let parsedPortfolio;
+      
+      // Parse portfolio if it's a string
+      if (typeof portfolio === 'string') {
+        try {
+          parsedPortfolio = JSON.parse(portfolio);
+        } catch (e) {
+          parsedPortfolio = {};
+        }
+      } else {
+        parsedPortfolio = portfolio;
+      }
+      
       // Initialize if doesn't exist
       if (!currentUser.portfolio) {
         currentUser.portfolio = {};
       }
       
       // Update specific portfolio fields
-      if (portfolio.bio) updateFields['portfolio.bio'] = portfolio.bio;
-      if (portfolio.about) updateFields['portfolio.about'] = portfolio.about;
+      if (parsedPortfolio.bio) updateFields['portfolio.bio'] = parsedPortfolio.bio;
+      if (parsedPortfolio.about || about) updateFields['portfolio.about'] = parsedPortfolio.about || about;
       
       // Handle work experience
-      if (portfolio.workExperience && Array.isArray(portfolio.workExperience)) {
-        updateFields['portfolio.workExperience'] = portfolio.workExperience;
+      if (parsedPortfolio.workExperience && Array.isArray(parsedPortfolio.workExperience)) {
+        updateFields['portfolio.workExperience'] = parsedPortfolio.workExperience;
       }
       
       // Handle education
-      if (portfolio.education && Array.isArray(portfolio.education)) {
-        updateFields['portfolio.education'] = portfolio.education;
+      if (parsedPortfolio.education && Array.isArray(parsedPortfolio.education)) {
+        updateFields['portfolio.education'] = parsedPortfolio.education;
       }
       
       // Handle languages
-      if (portfolio.languages && Array.isArray(portfolio.languages)) {
-        updateFields['portfolio.languages'] = portfolio.languages;
+      if (parsedPortfolio.languages && Array.isArray(parsedPortfolio.languages)) {
+        updateFields['portfolio.languages'] = parsedPortfolio.languages;
       }
       
       // Handle certifications
-      if (portfolio.certifications && Array.isArray(portfolio.certifications)) {
-        updateFields['portfolio.certifications'] = portfolio.certifications;
+      if (parsedPortfolio.certifications && Array.isArray(parsedPortfolio.certifications)) {
+        updateFields['portfolio.certifications'] = parsedPortfolio.certifications;
       }
       
       // Handle interests
-      if (portfolio.interests && Array.isArray(portfolio.interests)) {
-        updateFields['portfolio.interests'] = portfolio.interests;
+      if (parsedPortfolio.interests && Array.isArray(parsedPortfolio.interests)) {
+        updateFields['portfolio.interests'] = parsedPortfolio.interests;
       }
     }
 
@@ -2775,23 +2979,48 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
     res.json(updatedUser);
   } catch (error) {
     console.error('Profile update error:', error);
+    // Check if it's a multer error
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File is too large. Maximum size is 5MB.' });
+    }
     res.status(500).json({ error: 'Error updating profile' });
   }
 });
-
 // Get user profile
+app.get('/api/users/view/profile', authenticateToken, async (req, res) => {
+  try {
+    // Redirect to the proper analytics endpoint
+    return res.redirect('/api/profile-views/analytics');
+  } catch (error) {
+    console.error('Profile view redirect error:', error);
+    res.status(500).json({ error: 'Error processing request' });
+  }
+});
 app.get('/api/users/:userId/profile', authenticateToken, async (req, res) => {
   try {
     const targetUserId = req.params.userId;
     const currentUserId = req.user.id;
-    
+    if (targetUserId === 'view') {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
     // Check if current user is blocked by target user
-    const targetUser = await User.findById(targetUserId)
-      .select('-password -security -deviceTokens');
     
+    
+      // Check if userId is a reserved word
+   
+      
+      // Validate userId is a valid ObjectId
+      if (!mongoose.isValidObjectId(targetUserId)) {
+        return res.status(400).json({ error: 'Invalid user ID format' });
+      }
+      const targetUser = await User.findById(targetUserId)
+      .select('-password -security -deviceTokens');
+      
+      
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
+    
     
     // Check blocking relationship
     if (targetUser.blockedUsers && targetUser.blockedUsers.includes(currentUserId)) {
@@ -3460,8 +3689,3710 @@ app.post('/api/users/:userId/block', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error updating block status' });
   }
 });
+// ----------------------
+// ENHANCED MAP-BASED NETWORKING
+// ----------------------
+
+// Get professionals in radius with advanced filtering
+app.get('/api/network/map', authenticateToken, async (req, res) => {
+  try {
+    const {
+      latitude, longitude, radius = 10, // km
+      industries = [], skills = [], 
+      availableForMeeting = false,
+      availableForHiring = false,
+      lookingForWork = false,
+      page = 1, limit = 50
+    } = req.query;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location coordinates required' });
+    }
+    
+    // Parse arrays from query strings
+    const industriesArray = typeof industries === 'string' ? industries.split(',') : industries;
+    const skillsArray = typeof skills === 'string' ? skills.split(',') : skills;
+    
+    // Find users who are nearby and match filters
+    let query = {
+      _id: { $ne: req.user.id }, // Exclude current user
+      'location.coordinates': {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          },
+          $maxDistance: parseInt(radius) * 1000 // Convert km to meters
+        }
+      }
+    };
+    
+    // Add industry filter
+    if (industriesArray.length > 0) {
+      query.industry = { $in: industriesArray };
+    }
+    
+    // Add skills filter
+    if (skillsArray.length > 0) {
+      query['skills.name'] = { $in: skillsArray };
+    }
+    
+    // Availability filters
+    if (availableForMeeting === 'true') {
+      query['availableForMeeting'] = true;
+    }
+    
+    if (availableForHiring === 'true') {
+      query['availableForHiring'] = true;
+    }
+    
+    if (lookingForWork === 'true') {
+      query['lookingForWork'] = true;
+    }
+    
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Execute query
+    const users = await User.find(query)
+      .select('firstName lastName profilePicture headline industry skills location online lastActive availableForMeeting availableForHiring lookingForWork')
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    // Get total count
+    const total = await User.countDocuments(query);
+    
+    // Calculate distance and check connection status for each user
+    const currentUser = await User.findById(req.user.id);
+    const enhancedUsers = users.map(user => {
+      // Calculate distance
+      const distance = getDistanceFromLatLonInKm(
+        parseFloat(latitude),
+        parseFloat(longitude),
+        user.location.coordinates[1],
+        user.location.coordinates[0]
+      );
+      
+      // Check connection status
+      const isConnected = currentUser.connections.includes(user._id);
+      const isPending = currentUser.pendingConnections.includes(user._id);
+      const isFollowing = currentUser.following.includes(user._id);
+      
+      // Enhance user object
+      return {
+        ...user.toObject(),
+        distance: parseFloat(distance.toFixed(2)),
+        connectionStatus: {
+          isConnected,
+          isPending, 
+          isFollowing
+        }
+      };
+    });
+    
+    res.json({
+      users: enhancedUsers,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Map-based networking error:', error);
+    res.status(500).json({ error: 'Error fetching nearby professionals' });
+  }
+});
+
+// Update user's real-time location and availability status
+app.put('/api/network/location-status', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      latitude, longitude, address,
+      availableForMeeting, availableForHiring,
+      lookingForWork, visibilityDuration
+    } = req.body;
+    
+    // Validate coordinates
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location coordinates required' });
+    }
+    
+    const updateData = {
+      location: {
+        type: 'Point',
+        coordinates: [parseFloat(longitude), parseFloat(latitude)],
+        address: address || '',
+        lastUpdated: new Date()
+      }
+    };
+    
+    // Update availability flags if provided
+    if (availableForMeeting !== undefined) {
+      updateData.availableForMeeting = availableForMeeting;
+    }
+    
+    if (availableForHiring !== undefined) {
+      updateData.availableForHiring = availableForHiring;
+    }
+    
+    if (lookingForWork !== undefined) {
+      updateData.lookingForWork = lookingForWork;
+    }
+    
+    // Set expiration for availability if duration provided
+    if (visibilityDuration) {
+      const duration = parseInt(visibilityDuration); // in hours
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + duration);
+      
+      updateData.availabilityExpiresAt = expiresAt;
+    }
+    
+    // Update user
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user.id,
+      updateData,
+      { new: true }
+    );
+    
+    // Notify connected users if status changed
+    if (availableForMeeting !== undefined || 
+        availableForHiring !== undefined || 
+        lookingForWork !== undefined) {
+      // Emit to socket connections
+      io.to(`user_${req.user.id}`).emit('availability_updated', {
+        userId: req.user.id,
+        availableForMeeting: updatedUser.availableForMeeting,
+        availableForHiring: updatedUser.availableForHiring,
+        lookingForWork: updatedUser.lookingForWork
+      });
+    }
+    
+    res.json({
+      success: true,
+      location: updatedUser.location,
+      availability: {
+        availableForMeeting: updatedUser.availableForMeeting,
+        availableForHiring: updatedUser.availableForHiring,
+        lookingForWork: updatedUser.lookingForWork,
+        expiresAt: updatedUser.availabilityExpiresAt
+      }
+    });
+  } catch (error) {
+    console.error('Location-status update error:', error);
+    res.status(500).json({ error: 'Error updating location and status' });
+  }
+});
+
+// Request in-person meeting
+app.post('/api/network/meeting-request', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      targetUserId, 
+      proposedTime, // ISO datetime string
+      proposedLocation, // { name, address, coordinates: [lng, lat] }
+      message,
+      duration // in minutes
+    } = req.body;
+    
+    // Validate target user
+    const targetUser = await User.findById(targetUserId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if target user is available for meetings
+    if (!targetUser.availableForMeeting) {
+      return res.status(400).json({ error: 'User is not available for meetings' });
+    }
+    
+    // Create meeting request
+    const meeting = await Meeting.create({
+      requester: req.user.id,
+      recipient: targetUserId,
+      status: 'pending',
+      proposedTime: new Date(proposedTime),
+      proposedLocation,
+      message,
+      duration: duration || 30, // default to 30 minutes
+      createdAt: new Date()
+    });
+    
+    // Create notification
+    const user = await User.findById(req.user.id)
+      .select('firstName lastName profilePicture');
+      
+    await createNotification({
+      recipient: targetUserId,
+      sender: req.user.id,
+      type: 'meeting_request',
+      contentType: 'meeting',
+      contentId: meeting._id,
+      text: `${user.firstName} ${user.lastName} wants to meet with you`,
+      actionUrl: `/meetings/${meeting._id}`
+    });
+    
+    // Notify via socket if user is online
+    io.to(`user_${targetUserId}`).emit('meeting_request', {
+      meeting,
+      from: {
+        _id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        profilePicture: user.profilePicture
+      }
+    });
+    
+    res.status(201).json({
+      success: true,
+      meeting
+    });
+  } catch (error) {
+    console.error('Meeting request error:', error);
+    res.status(500).json({ error: 'Error creating meeting request' });
+  }
+});
+
+// Respond to meeting request
+app.put('/api/network/meeting-request/:meetingId', authenticateToken, async (req, res) => {
+  try {
+    const { status, alternativeTime, alternativeLocation, message } = req.body;
+    
+    if (!['accepted', 'declined', 'rescheduled'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    
+    // Find meeting and verify recipient
+    const meeting = await Meeting.findById(req.params.meetingId);
+    if (!meeting) {
+      return res.status(404).json({ error: 'Meeting request not found' });
+    }
+    
+    if (meeting.recipient.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to respond to this meeting request' });
+    }
+    
+    // Update meeting
+    const updateData = { status };
+    
+    if (status === 'rescheduled') {
+      if (!alternativeTime) {
+        return res.status(400).json({ error: 'Alternative time required for rescheduling' });
+      }
+      
+      updateData.alternativeTime = new Date(alternativeTime);
+      updateData.alternativeLocation = alternativeLocation;
+      updateData.recipientMessage = message;
+    }
+    
+    const updatedMeeting = await Meeting.findByIdAndUpdate(
+      req.params.meetingId,
+      updateData,
+      { new: true }
+    );
+    
+    // Notify requester
+    const user = await User.findById(req.user.id)
+      .select('firstName lastName profilePicture');
+      
+    let notificationType, notificationText;
+    
+    switch(status) {
+      case 'accepted':
+        notificationType = 'meeting_accepted';
+        notificationText = `${user.firstName} ${user.lastName} accepted your meeting request`;
+        break;
+      case 'declined':
+        notificationType = 'meeting_declined';
+        notificationText = `${user.firstName} ${user.lastName} declined your meeting request`;
+        break;
+      case 'rescheduled':
+        notificationType = 'meeting_rescheduled';
+        notificationText = `${user.firstName} ${user.lastName} proposed a new time for your meeting`;
+        break;
+    }
+    
+    await createNotification({
+      recipient: meeting.requester,
+      sender: req.user.id,
+      type: notificationType,
+      contentType: 'meeting',
+      contentId: meeting._id,
+      text: notificationText,
+      actionUrl: `/meetings/${meeting._id}`
+    });
+    
+    // Notify via socket
+    io.to(`user_${meeting.requester}`).emit('meeting_response', {
+      meetingId: meeting._id,
+      status,
+      responder: {
+        _id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName
+      }
+    });
+    
+    res.json({
+      success: true,
+      meeting: updatedMeeting
+    });
+  } catch (error) {
+    console.error('Meeting response error:', error);
+    res.status(500).json({ error: 'Error responding to meeting request' });
+  }
+});
+
+// Get user's meetings
+app.get('/api/network/meetings', authenticateToken, async (req, res) => {
+  try {
+    const { status, type, page = 1, limit = 10 } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build query
+    let query = {
+      $or: [
+        { requester: req.user.id },
+        { recipient: req.user.id }
+      ]
+    };
+    
+    // Filter by status
+    if (status) {
+      query.status = status;
+    }
+    
+    // Filter by type (sent/received)
+    if (type === 'sent') {
+      query = { requester: req.user.id };
+    } else if (type === 'received') {
+      query = { recipient: req.user.id };
+    }
+    
+    // Execute query
+    const meetings = await Meeting.find(query)
+      .populate('requester', 'firstName lastName profilePicture headline')
+      .populate('recipient', 'firstName lastName profilePicture headline')
+      .sort('-createdAt')
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    // Get total count
+    const total = await Meeting.countDocuments(query);
+    
+    res.json({
+      meetings,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get meetings error:', error);
+    res.status(500).json({ error: 'Error fetching meetings' });
+  }
+});
 
 // ----------------------
+// ENHANCED EVENT MANAGEMENT
+// ----------------------
+
+// Create recurrent events
+app.post('/api/events/recurrent', authenticateToken, upload.single('coverImage'), async (req, res) => {
+  try {
+    const {
+      title, description, eventType, category, tags,
+      startDate, endDate, location, privacy,
+      recurrencePattern, // daily, weekly, monthly, custom
+      daysOfWeek, // [0,1,4] (for weekly, 0=Sunday)
+      daysOfMonth, // [1,15] (for monthly)
+      monthsOfYear, // [0,6] (for yearly, 0=January)
+      interval, // every X days/weeks/months
+      until // end date for recurrence
+    } = req.body;
+    
+    // Validate recurrence data
+    if (!recurrencePattern) {
+      return res.status(400).json({ error: 'Recurrence pattern is required' });
+    }
+    
+    // Process location
+    let locationData = {};
+    if (typeof location === 'string') {
+      try {
+        locationData = JSON.parse(location);
+      } catch (e) {
+        locationData = { address: location };
+      }
+    } else if (typeof location === 'object') {
+      locationData = location;
+    }
+    
+    // Calculate recurrence dates
+    let recurrenceDates = [];
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const untilDate = until ? new Date(until) : new Date();
+    untilDate.setFullYear(untilDate.getFullYear() + 1); // Default to 1 year if not specified
+    
+    const eventDuration = end - start; // in milliseconds
+    
+    switch (recurrencePattern) {
+      case 'daily':
+        for (let date = new Date(start); date <= untilDate; date.setDate(date.getDate() + (interval || 1))) {
+          recurrenceDates.push({
+            startDate: new Date(date),
+            endDate: new Date(date.getTime() + eventDuration)
+          });
+        }
+        break;
+        
+      case 'weekly':
+        const weekdays = daysOfWeek ? JSON.parse(daysOfWeek) : [start.getDay()];
+        for (let date = new Date(start); date <= untilDate; date.setDate(date.getDate() + 1)) {
+          if (weekdays.includes(date.getDay())) {
+            recurrenceDates.push({
+              startDate: new Date(date),
+              endDate: new Date(date.getTime() + eventDuration)
+            });
+          }
+          
+          // Skip to next week if we've processed all days of current week
+          if (date.getDay() === 6 && (interval || 1) > 1) {
+            date.setDate(date.getDate() + (7 * ((interval || 1) - 1)));
+          }
+        }
+        break;
+        
+      case 'monthly':
+        const monthDays = daysOfMonth ? JSON.parse(daysOfMonth) : [start.getDate()];
+        for (let date = new Date(start); date <= untilDate;) {
+          const currentMonth = date.getMonth();
+          
+          // Check each day in monthDays
+          for (const day of monthDays) {
+            const specificDate = new Date(date);
+            specificDate.setDate(day);
+            
+            // If valid date and not before start date
+            if (specificDate.getMonth() === currentMonth && specificDate >= start) {
+              recurrenceDates.push({
+                startDate: new Date(specificDate),
+                endDate: new Date(specificDate.getTime() + eventDuration)
+              });
+            }
+          }
+          
+          // Move to next month
+          date.setMonth(date.getMonth() + (interval || 1));
+          date.setDate(1); // Reset to first day of month
+        }
+        break;
+        
+      case 'yearly':
+        const months = monthsOfYear ? JSON.parse(monthsOfYear) : [start.getMonth()];
+        for (let year = start.getFullYear(); year <= untilDate.getFullYear(); year += (interval || 1)) {
+          for (const month of months) {
+            const specificDate = new Date(year, month, start.getDate());
+            
+            // If not before start date
+            if (specificDate >= start) {
+              recurrenceDates.push({
+                startDate: new Date(specificDate),
+                endDate: new Date(specificDate.getTime() + eventDuration)
+              });
+            }
+          }
+        }
+        break;
+    }
+    
+    // Limit to reasonable number
+    if (recurrenceDates.length > 100) {
+      recurrenceDates = recurrenceDates.slice(0, 100);
+    }
+    
+    // Create base event
+    const baseEvent = {
+      creator: req.user.id,
+      title,
+      description,
+      eventType,
+      category,
+      tags: tags ? (typeof tags === 'string' ? tags.split(',') : tags) : [],
+      location: locationData,
+      coverImage: req.file ? req.file.path : null,
+      privacy,
+      attendees: [{ user: req.user.id, status: 'going' }],
+      recurrencePattern,
+      recurrenceSettings: {
+        pattern: recurrencePattern,
+        daysOfWeek: daysOfWeek ? JSON.parse(daysOfWeek) : null,
+        daysOfMonth: daysOfMonth ? JSON.parse(daysOfMonth) : null,
+        monthsOfYear: monthsOfYear ? JSON.parse(monthsOfYear) : null,
+        interval: interval ? parseInt(interval) : 1,
+        until: untilDate
+      }
+    };
+    
+    // Create series ID
+    const seriesId = new mongoose.Types.ObjectId();
+    
+    // Create events for each recurrence date
+    const events = [];
+    for (const [index, dates] of recurrenceDates.entries()) {
+      const event = await Event.create({
+        ...baseEvent,
+        startDate: dates.startDate,
+        endDate: dates.endDate,
+        seriesId: seriesId,
+        isRecurring: true,
+        recurrenceIndex: index
+      });
+      
+      events.push(event);
+    }
+    
+    // Update hashtags if provided
+    if (tags) {
+      const tagsArray = typeof tags === 'string' ? tags.split(',') : tags;
+      await updateHashtags(tagsArray, 'event');
+    }
+    
+    // Return just the first event with metadata about the series
+    const firstEvent = await Event.findById(events[0]._id)
+      .populate('creator', 'firstName lastName profilePicture');
+    
+    res.status(201).json({
+      event: firstEvent,
+      recurrenceSeries: {
+        seriesId: seriesId,
+        pattern: recurrencePattern,
+        totalEvents: events.length
+      }
+    });
+  } catch (error) {
+    console.error('Create recurrent event error:', error);
+    res.status(500).json({ error: 'Error creating recurrent event' });
+  }
+});
+
+// Respond to event invitation
+app.post('/api/events/:eventId/respond', authenticateToken, async (req, res) => {
+  try {
+    const { status, message } = req.body;
+    
+    if (!['going', 'interested', 'not-going'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    
+    const event = await Event.findById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    
+    // Check if already responded
+    const existingResponse = event.attendees.find(
+      attendee => attendee.user.toString() === req.user.id
+    );
+    
+    if (existingResponse) {
+      // Update existing response
+      existingResponse.status = status;
+      existingResponse.message = message;
+      existingResponse.updatedAt = new Date();
+    } else {
+      // Add new response
+      event.attendees.push({
+        user: req.user.id,
+        status,
+        message,
+        respondedAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+    
+    await event.save();
+    
+    // Notify event creator if not the user
+    if (event.creator.toString() !== req.user.id) {
+      const user = await User.findById(req.user.id)
+        .select('firstName lastName profilePicture');
+        
+      let notificationText;
+      switch(status) {
+        case 'going':
+          notificationText = `${user.firstName} ${user.lastName} is attending your event`;
+          break;
+        case 'interested':
+          notificationText = `${user.firstName} ${user.lastName} is interested in your event`;
+          break;
+        case 'not-going':
+          notificationText = `${user.firstName} ${user.lastName} declined your event`;
+          break;
+      }
+      
+      await createNotification({
+        recipient: event.creator,
+        sender: req.user.id,
+        type: 'event_rsvp',
+        contentType: 'event',
+        contentId: event._id,
+        text: notificationText,
+        actionUrl: `/events/${event._id}`
+      });
+    }
+    
+    // Populate updated event with attendee info
+    const updatedEvent = await Event.findById(event._id)
+      .populate('creator', 'firstName lastName profilePicture')
+      .populate('attendees.user', 'firstName lastName profilePicture');
+    
+    res.json({
+      success: true,
+      event: updatedEvent,
+      userStatus: status
+    });
+  } catch (error) {
+    console.error('Event response error:', error);
+    res.status(500).json({ error: 'Error responding to event' });
+  }
+});
+
+// Get event attendees with pagination and filtering
+app.get('/api/events/:eventId/attendees', authenticateToken, async (req, res) => {
+  try {
+    const { status, page = 1, limit = 20, search } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const event = await Event.findById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    
+    // Filter attendees by status
+    let attendeeIds = event.attendees;
+    if (status) {
+      attendeeIds = event.attendees.filter(
+        attendee => attendee.status === status
+      );
+    }
+    
+    // Extract just the user IDs
+    const userIds = attendeeIds.map(attendee => attendee.user);
+    
+    // Build user query
+    let userQuery = {
+      _id: { $in: userIds }
+    };
+    
+    // Add search filter if provided
+    if (search) {
+      userQuery.$or = [
+        { firstName: { $regex: search, $options: 'i' } },
+        { lastName: { $regex: search, $options: 'i' } },
+        { headline: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    // Get users with pagination
+    const users = await User.find(userQuery)
+      .select('firstName lastName profilePicture headline industry')
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count
+    const total = await User.countDocuments(userQuery);
+    
+    // Combine user info with attendance info
+    const attendees = users.map(user => {
+      const attendeeInfo = event.attendees.find(
+        attendee => attendee.user.toString() === user._id.toString()
+      );
+      
+      return {
+        user,
+        status: attendeeInfo.status,
+        message: attendeeInfo.message,
+        respondedAt: attendeeInfo.respondedAt,
+        updatedAt: attendeeInfo.updatedAt
+      };
+    });
+    
+    res.json({
+      attendees,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get event attendees error:', error);
+    res.status(500).json({ error: 'Error fetching event attendees' });
+  }
+});
+
+// Send event invitation to connections
+app.post('/api/events/:eventId/invite', authenticateToken, async (req, res) => {
+  try {
+    const { userIds, message } = req.body;
+    
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: 'User IDs are required' });
+    }
+    
+    const event = await Event.findById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    
+    // Check if user is the creator or going to the event
+    const isCreator = event.creator.toString() === req.user.id;
+    const isAttending = event.attendees.some(
+      attendee => attendee.user.toString() === req.user.id && attendee.status === 'going'
+    );
+    
+    if (!isCreator && !isAttending) {
+      return res.status(403).json({ 
+        error: 'Only the event creator or attendees can send invitations' 
+      });
+    }
+    
+    // Validate invitees
+    const users = await User.find({ _id: { $in: userIds } })
+      .select('_id firstName lastName');
+      
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'No valid users found' });
+    }
+    
+    // Track successful invites
+    const invitedUsers = [];
+    const currentUser = await User.findById(req.user.id)
+      .select('firstName lastName');
+    
+    // Send invitations
+    for (const user of users) {
+      // Check if already invited or attending
+      const alreadyInvited = event.invitations && event.invitations.some(
+        invite => invite.user.toString() === user._id.toString()
+      );
+      
+      const alreadyAttending = event.attendees.some(
+        attendee => attendee.user.toString() === user._id.toString()
+      );
+      
+      if (!alreadyInvited && !alreadyAttending) {
+        // Add to event invitations
+        if (!event.invitations) {
+          event.invitations = [];
+        }
+        
+        event.invitations.push({
+          user: user._id,
+          invitedBy: req.user.id,
+          message,
+          invitedAt: new Date()
+        });
+        
+        // Create notification
+        await createNotification({
+          recipient: user._id,
+          sender: req.user.id,
+          type: 'event_invite',
+          contentType: 'event',
+          contentId: event._id,
+          text: `${currentUser.firstName} ${currentUser.lastName} invited you to an event: ${event.title}`,
+          actionUrl: `/events/${event._id}`
+        });
+        
+        invitedUsers.push(user);
+      }
+    }
+    
+    await event.save();
+    
+    res.json({
+      success: true,
+      invitedUsers,
+      event: {
+        _id: event._id,
+        title: event.title
+      }
+    });
+  } catch (error) {
+    console.error('Event invitation error:', error);
+    res.status(500).json({ error: 'Error sending event invitations' });
+  }
+});
+
+// Check in to event (with location verification)
+app.post('/api/events/:eventId/checkin', authenticateToken, async (req, res) => {
+  try {
+    const { latitude, longitude, checkInCode } = req.body;
+    
+    const event = await Event.findById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    
+    // Verify check-in code if provided by event
+    if (event.checkInCode && event.checkInCode !== checkInCode) {
+      return res.status(403).json({ error: 'Invalid check-in code' });
+    }
+    
+    // Verify event is currently happening
+    const now = new Date();
+    if (now < event.startDate || now > event.endDate) {
+      return res.status(400).json({ 
+        error: 'Check-in only available during the event',
+        eventTime: {
+          start: event.startDate,
+          end: event.endDate,
+          current: now
+        }
+      });
+    }
+    
+    // Verify location if coordinates provided
+    if (latitude && longitude && event.location && event.location.coordinates) {
+      // Calculate distance between user and event
+      const distance = getDistanceFromLatLonInKm(
+        parseFloat(latitude),
+        parseFloat(longitude),
+        event.location.coordinates[1],
+        event.location.coordinates[0]
+      );
+      
+      // Allow check-in if within 100m of event location
+      if (distance > 0.1) {
+        return res.status(400).json({ 
+          error: 'You must be at the event location to check in',
+          distance: distance,
+          unit: 'km',
+          threshold: 0.1
+        });
+      }
+    }
+    
+    // Find attendee entry
+    const attendeeIndex = event.attendees.findIndex(
+      attendee => attendee.user.toString() === req.user.id
+    );
+    
+    if (attendeeIndex === -1) {
+      // Not in attendee list, add them with going status
+      event.attendees.push({
+        user: req.user.id,
+        status: 'going',
+        checkedIn: true,
+        checkInTime: new Date()
+      });
+    } else {
+      // Update existing attendee
+      event.attendees[attendeeIndex].checkedIn = true;
+      event.attendees[attendeeIndex].checkInTime = new Date();
+    }
+    
+    await event.save();
+    
+    // Record this in activity history
+    await ActivityLog.create({
+      user: req.user.id,
+      activityType: 'event_checkin',
+      entityId: event._id,
+      entityType: 'event',
+      metadata: {
+        eventTitle: event.title,
+        location: {
+          latitude,
+          longitude
+        }
+      }
+    });
+    
+    res.json({
+      success: true,
+      checkedIn: true,
+      checkInTime: new Date()
+    });
+  } catch (error) {
+    console.error('Event check-in error:', error);
+    res.status(500).json({ error: 'Error checking in to event' });
+  }
+});
+
+// Event analytics for organizers
+app.get('/api/events/:eventId/analytics', authenticateToken, async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    
+    // Check if user is the creator
+    if (event.creator.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Only the event creator can view analytics' });
+    }
+    
+    // Calculate attendance stats
+    const totalResponses = event.attendees.length;
+    const goingCount = event.attendees.filter(a => a.status === 'going').length;
+    const interestedCount = event.attendees.filter(a => a.status === 'interested').length;
+    const notGoingCount = event.attendees.filter(a => a.status === 'not-going').length;
+    const checkedInCount = event.attendees.filter(a => a.checkedIn).length;
+    
+    // Calculate response rate from invitations
+    const invitationCount = event.invitations ? event.invitations.length : 0;
+    const responseRate = invitationCount > 0 
+      ? Math.round((totalResponses / invitationCount) * 100) 
+      : 0;
+    
+    // Get views count (if tracked)
+    const viewsCount = event.views || 0;
+    
+    // Get check-in rate
+    const checkInRate = goingCount > 0 
+      ? Math.round((checkedInCount / goingCount) * 100) 
+      : 0;
+    
+    res.json({
+      attendance: {
+        going: goingCount,
+        interested: interestedCount,
+        notGoing: notGoingCount,
+        checkedIn: checkedInCount,
+        total: totalResponses
+      },
+      engagement: {
+        invitations: invitationCount,
+        responseRate: responseRate,
+        views: viewsCount,
+        checkInRate: checkInRate
+      },
+      demographics: {
+        // Add demographic info if tracked
+      }
+    });
+  } catch (error) {
+    console.error('Event analytics error:', error);
+    res.status(500).json({ error: 'Error fetching event analytics' });
+  }
+});
+
+// ----------------------
+// ENHANCED CONTENT & INTERACTION SYSTEM
+// ----------------------
+
+// Advanced content filters based on interest and relevance
+app.get('/api/content/feed', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      type = 'all',    // posts, events, jobs, projects
+      filter = 'recommended', // recent, popular, connections, following
+      page = 1, 
+      limit = 10,
+      location = false // include location-based content
+    } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const user = await User.findById(req.user.id);
+    
+    // Build base query based on type and filters
+    let contentQueries = [];
+    let locationFilter = {};
+    
+    // Add location filter if requested
+    if (location === 'true' && user.location && user.location.coordinates) {
+      locationFilter = {
+        'location.coordinates': {
+          $near: {
+            $geometry: {
+              type: 'Point',
+              coordinates: user.location.coordinates
+            },
+            $maxDistance: 50000 // 50km radius
+          }
+        }
+      };
+    }
+    
+    // Determine content sources based on type
+    if (type === 'all' || type === 'posts') {
+      // Build post query
+      let postQuery = {};
+      
+      if (filter === 'connections') {
+        postQuery.author = { $in: user.connections || [] };
+      } else if (filter === 'following') {
+        postQuery.author = { $in: user.following || [] };
+      } else if (filter === 'popular') {
+        // Sort by engagement later
+      }
+      
+      // Privacy filter for posts
+      postQuery.$or = [
+        { visibility: 'public' },
+        { visibility: 'connections', author: { $in: user.connections || [] } },
+        { author: req.user.id }
+      ];
+      
+      // Add location filter if applicable
+      if (Object.keys(locationFilter).length > 0) {
+        postQuery = { ...postQuery, ...locationFilter };
+      }
+      
+      contentQueries.push({
+        model: Post,
+        query: postQuery,
+        populate: [
+          { path: 'author', select: 'firstName lastName profilePicture headline' },
+          { path: 'likes.user', select: 'firstName lastName profilePicture' }
+        ],
+        type: 'post',
+        sortBy: filter === 'popular' ? { 'likes.length': -1 } : { createdAt: -1 }
+      });
+    }
+    
+    if (type === 'all' || type === 'events') {
+      // Build event query
+      let eventQuery = {
+        startDate: { $gte: new Date() } // Only upcoming events
+      };
+      
+      if (filter === 'connections') {
+        eventQuery.creator = { $in: user.connections || [] };
+      } else if (filter === 'following') {
+        eventQuery.creator = { $in: user.following || [] };
+      } else if (filter === 'popular') {
+        // Sort by attendance later
+      }
+      
+      // Privacy filter for events
+      eventQuery.$or = [
+        { privacy: 'public' },
+        { privacy: 'connections', creator: { $in: user.connections || [] } },
+        { creator: req.user.id }
+      ];
+      
+      // Add location filter if applicable
+      if (Object.keys(locationFilter).length > 0) {
+        eventQuery = { ...eventQuery, ...locationFilter };
+      }
+      
+      contentQueries.push({
+        model: Event,
+        query: eventQuery,
+        populate: [
+          { path: 'creator', select: 'firstName lastName profilePicture headline' }
+        ],
+        type: 'event',
+        sortBy: filter === 'popular' ? { 'attendees.length': -1 } : { startDate: 1 }
+      });
+    }
+    
+    if (type === 'all' || type === 'jobs') {
+      // Build job query
+      let jobQuery = {
+        active: true
+      };
+      
+      if (filter === 'recommended') {
+        // Add skills filter for better recommendation
+        if (user.skills && user.skills.length > 0) {
+          const userSkills = user.skills.map(s => s.name);
+          jobQuery.skills = { $in: userSkills };
+        }
+        
+        if (user.industry) {
+          jobQuery.industry = user.industry;
+        }
+      } else if (filter === 'connections') {
+        jobQuery.creator = { $in: user.connections || [] };
+      }
+      
+      // Add location filter if applicable
+      if (Object.keys(locationFilter).length > 0) {
+        jobQuery = { ...jobQuery, ...locationFilter };
+      }
+      
+      contentQueries.push({
+        model: Job,
+        query: jobQuery,
+        populate: [
+          { path: 'creator', select: 'firstName lastName profilePicture headline' }
+        ],
+        type: 'job',
+        sortBy: { createdAt: -1 }
+      });
+    }
+    
+    if (type === 'all' || type === 'projects') {
+      // Build projects query
+      let projectQuery = {};
+      
+      if (filter === 'connections') {
+        projectQuery.user = { $in: user.connections || [] };
+      } else if (filter === 'following') {
+        projectQuery.user = { $in: user.following || [] };
+      }
+      
+      // Privacy filter for projects
+      projectQuery.$or = [
+        { visibility: 'public' },
+        { visibility: 'connections', user: { $in: user.connections || [] } },
+        { user: req.user.id }
+      ];
+      
+      contentQueries.push({
+        model: Project,
+        query: projectQuery,
+        populate: [
+          { path: 'user', select: 'firstName lastName profilePicture headline' }
+        ],
+        type: 'project',
+        sortBy: { updatedAt: -1 }
+      });
+    }
+    
+    // Execute queries and combine results
+    const contentResults = await Promise.all(
+      contentQueries.map(async ({ model, query, populate, type, sortBy }) => {
+        try {
+          const items = await model.find(query)
+            .populate(populate)
+            .sort(sortBy)
+            .skip(skip)
+            .limit(parseInt(limit));
+            
+          const count = await model.countDocuments(query);
+          
+          return {
+            type,
+            items,
+            count
+          };
+        } catch (err) {
+          console.error(`Error fetching ${type} content:`, err);
+          return {
+            type,
+            items: [],
+            count: 0,
+            error: err.message
+          };
+        }
+      })
+    );
+    
+    // Combine results and sort by date/relevance
+    const combinedResults = contentResults
+      .flatMap(result => result.items.map(item => ({
+        ...item.toObject(),
+        contentType: result.type
+      })))
+      .sort((a, b) => {
+        const dateA = a.startDate || a.createdAt || a.updatedAt;
+        const dateB = b.startDate || b.createdAt || b.updatedAt;
+        return new Date(dateB) - new Date(dateA);
+      });
+    
+    // Calculate total across all content types
+    const totalItems = contentResults.reduce((sum, result) => sum + result.count, 0);
+    
+    res.json({
+      content: combinedResults.slice(0, limit),
+      contentTypes: contentResults.map(r => ({ type: r.type, count: r.count })),
+      pagination: {
+        total: totalItems,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(totalItems / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Content feed error:', error);
+    res.status(500).json({ error: 'Error fetching content feed' });
+  }
+});
+
+// Advanced search with filters
+app.get('/api/search', authenticateToken, async (req, res) => {
+  try {
+    const {
+      query,
+      type = 'all', // users, posts, events, jobs, projects, companies
+      filter = {},
+      page = 1,
+      limit = 20
+    } = req.query;
+    
+    if (!query) {
+      return res.status(400).json({ error: 'Search query is required' });
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Parse filters if provided as string
+    let parsedFilter = filter;
+    if (typeof filter === 'string') {
+      try {
+        parsedFilter = JSON.parse(filter);
+      } catch (e) {
+        parsedFilter = {};
+      }
+    }
+    
+    // Build search query based on content type
+    let searchResults;
+    let totalCount = 0;
+    
+    if (type === 'all' || type === 'users') {
+      // User search
+      const userQuery = {
+        $or: [
+          { firstName: { $regex: query, $options: 'i' } },
+          { lastName: { $regex: query, $options: 'i' } },
+          { headline: { $regex: query, $options: 'i' } },
+          { 'skills.name': { $regex: query, $options: 'i' } }
+        ],
+        _id: { $ne: req.user.id } // Exclude current user
+      };
+      
+      // Add industry filter
+      if (parsedFilter.industry) {
+        userQuery.industry = parsedFilter.industry;
+      }
+      
+      // Add location filter
+      if (parsedFilter.location) {
+        userQuery['location.address'] = { $regex: parsedFilter.location, $options: 'i' };
+      }
+      
+      // Add skills filter
+      if (parsedFilter.skills && Array.isArray(parsedFilter.skills)) {
+        userQuery['skills.name'] = { $in: parsedFilter.skills };
+      }
+      
+      const users = await User.find(userQuery)
+        .select('firstName lastName profilePicture headline industry skills location')
+        .skip(type === 'users' ? skip : 0)
+        .limit(type === 'users' ? parseInt(limit) : 5);
+        
+      const userCount = await User.countDocuments(userQuery);
+      totalCount += userCount;
+      
+      if (!searchResults) searchResults = {};
+      searchResults.users = {
+        items: users,
+        count: userCount
+      };
+    }
+    
+    if (type === 'all' || type === 'posts') {
+      // Post search
+      const postQuery = {
+        $or: [
+          { content: { $regex: query, $options: 'i' } },
+          { tags: { $regex: query, $options: 'i' } }
+        ],
+        // Only show posts the user has permission to see
+        $or: [
+          { visibility: 'public' },
+          { visibility: 'connections', author: { $in: (await User.findById(req.user.id)).connections || [] } },
+          { author: req.user.id }
+        ]
+      };
+      
+      // Add date range filter
+      if (parsedFilter.dateFrom) {
+        if (!postQuery.createdAt) postQuery.createdAt = {};
+        postQuery.createdAt.$gte = new Date(parsedFilter.dateFrom);
+      }
+      
+      if (parsedFilter.dateTo) {
+        if (!postQuery.createdAt) postQuery.createdAt = {};
+        postQuery.createdAt.$lte = new Date(parsedFilter.dateTo);
+      }
+      
+      const posts = await Post.find(postQuery)
+        .populate('author', 'firstName lastName profilePicture headline')
+        .sort({ createdAt: -1 })
+        .skip(type === 'posts' ? skip : 0)
+        .limit(type === 'posts' ? parseInt(limit) : 5);
+        
+      const postCount = await Post.countDocuments(postQuery);
+      totalCount += postCount;
+      
+      if (!searchResults) searchResults = {};
+      searchResults.posts = {
+        items: posts,
+        count: postCount
+      };
+    }
+    
+    if (type === 'all' || type === 'events') {
+      // Event search
+      const eventQuery = {
+        $or: [
+          { title: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } },
+          { category: { $regex: query, $options: 'i' } },
+          { tags: { $regex: query, $options: 'i' } }
+        ],
+        // Filter to respect privacy settings
+        $or: [
+          { privacy: 'public' },
+          { privacy: 'connections', creator: { $in: (await User.findById(req.user.id)).connections || [] } },
+          { creator: req.user.id }
+        ]
+      };
+      
+      // Only upcoming events by default
+      if (!parsedFilter.includePastEvents) {
+        eventQuery.startDate = { $gte: new Date() };
+      }
+      
+      // Add date range filter
+      if (parsedFilter.dateFrom) {
+        if (!eventQuery.startDate) eventQuery.startDate = {};
+        eventQuery.startDate.$gte = new Date(parsedFilter.dateFrom);
+      }
+      
+      if (parsedFilter.dateTo) {
+        if (!eventQuery.endDate) eventQuery.endDate = {};
+        eventQuery.endDate.$lte = new Date(parsedFilter.dateTo);
+      }
+      
+      // Add category filter
+      if (parsedFilter.category) {
+        eventQuery.category = parsedFilter.category;
+      }
+      
+      // Add location filter
+      if (parsedFilter.location) {
+        eventQuery['location.address'] = { $regex: parsedFilter.location, $options: 'i' };
+      }
+      
+      const events = await Event.find(eventQuery)
+        .populate('creator', 'firstName lastName profilePicture headline')
+        .sort({ startDate: 1 })
+        .skip(type === 'events' ? skip : 0)
+        .limit(type === 'events' ? parseInt(limit) : 5);
+        
+      const eventCount = await Event.countDocuments(eventQuery);
+      totalCount += eventCount;
+      
+      if (!searchResults) searchResults = {};
+      searchResults.events = {
+        items: events,
+        count: eventCount
+      };
+    }
+    
+    if (type === 'all' || type === 'jobs') {
+      // Job search
+      const jobQuery = {
+        $or: [
+          { title: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } },
+          { skills: { $regex: query, $options: 'i' } },
+          { industry: { $regex: query, $options: 'i' } }
+        ],
+        active: true
+      };
+      
+      // Add job type filter
+      if (parsedFilter.jobType) {
+        jobQuery.jobType = parsedFilter.jobType;
+      }
+      
+      // Add location filter
+      if (parsedFilter.location) {
+        jobQuery['location.city'] = { $regex: parsedFilter.location, $options: 'i' };
+      }
+      
+      // Add salary range filter
+      if (parsedFilter.salaryMin) {
+        if (!jobQuery['salary.min']) jobQuery['salary.min'] = {};
+        jobQuery['salary.min'].$gte = parseInt(parsedFilter.salaryMin);
+      }
+      
+      if (parsedFilter.salaryMax) {
+        if (!jobQuery['salary.max']) jobQuery['salary.max'] = {};
+        jobQuery['salary.max'].$lte = parseInt(parsedFilter.salaryMax);
+      }
+      
+      // Add experience level filter
+      if (parsedFilter.experienceLevel) {
+        jobQuery.experienceLevel = parsedFilter.experienceLevel;
+      }
+      
+      const jobs = await Job.find(jobQuery)
+        .populate('creator', 'firstName lastName profilePicture headline')
+        .sort({ createdAt: -1 })
+        .skip(type === 'jobs' ? skip : 0)
+        .limit(type === 'jobs' ? parseInt(limit) : 5);
+        
+      const jobCount = await Job.countDocuments(jobQuery);
+      totalCount += jobCount;
+      
+      if (!searchResults) searchResults = {};
+      searchResults.jobs = {
+        items: jobs,
+        count: jobCount
+      };
+    }
+    
+    if (type === 'all' || type === 'companies') {
+      // Company search
+      const companyQuery = {
+        $or: [
+          { name: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } },
+          { industry: { $regex: query, $options: 'i' } }
+        ]
+      };
+      
+      // Add industry filter
+      if (parsedFilter.industry) {
+        companyQuery.industry = parsedFilter.industry;
+      }
+      
+      // Add size filter
+      if (parsedFilter.size) {
+        companyQuery.size = parsedFilter.size;
+      }
+      
+      // Add location filter
+      if (parsedFilter.location) {
+        companyQuery['headquarters.city'] = { $regex: parsedFilter.location, $options: 'i' };
+      }
+      
+      const companies = await Company.find(companyQuery)
+        .sort({ name: 1 })
+        .skip(type === 'companies' ? skip : 0)
+        .limit(type === 'companies' ? parseInt(limit) : 5);
+        
+      const companyCount = await Company.countDocuments(companyQuery);
+      totalCount += companyCount;
+      
+      if (!searchResults) searchResults = {};
+      searchResults.companies = {
+        items: companies,
+        count: companyCount
+      };
+    }
+    
+    res.json({
+      query,
+      results: searchResults,
+      totalResults: totalCount,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(totalCount / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: 'Error performing search' });
+  }
+});
+
+// Trending topics and hashtags
+app.get('/api/trending', authenticateToken, async (req, res) => {
+  try {
+    const { period = 'day', category, location } = req.query;
+    
+    // Determine time range based on period
+    const now = new Date();
+    let since = new Date();
+    
+    switch (period) {
+      case 'hour':
+        since.setHours(since.getHours() - 1);
+        break;
+      case 'day':
+        since.setDate(since.getDate() - 1);
+        break;
+      case 'week':
+        since.setDate(since.getDate() - 7);
+        break;
+      case 'month':
+        since.setMonth(since.getMonth() - 1);
+        break;
+    }
+    
+    // Build base query for content created within time period
+    const timeQuery = { createdAt: { $gte: since, $lte: now } };
+    
+    // Build location query if provided
+    let locationQuery = {};
+    if (location) {
+      // If location is coordinates
+      if (location.includes(',')) {
+        const [lat, lng] = location.split(',').map(parseFloat);
+        locationQuery = {
+          'location.coordinates': {
+            $near: {
+              $geometry: {
+                type: 'Point',
+                coordinates: [lng, lat]
+              },
+              $maxDistance: 50000 // 50km radius
+            }
+          }
+        };
+      } else {
+        // If location is text
+        locationQuery = {
+          $or: [
+            { 'location.address': { $regex: location, $options: 'i' } },
+            { 'location.city': { $regex: location, $options: 'i' } },
+            { 'location.country': { $regex: location, $options: 'i' } }
+          ]
+        };
+      }
+    }
+    
+    // Build category query if provided
+    let categoryQuery = {};
+    if (category) {
+      categoryQuery = { category };
+    }
+    
+    // Get trending hashtags
+    const trendingHashtags = await Hashtag.find({ trending: true })
+      .sort({ postCount: -1, eventCount: -1, jobCount: -1 })
+      .limit(10);
+    
+    // Get trending posts
+    const trendingPosts = await Post.aggregate([
+      { $match: { ...timeQuery, ...locationQuery, ...categoryQuery } },
+      { $addFields: { engagementScore: { $add: [
+        { $size: '$likes' },
+        { $multiply: [{ $size: '$comments' }, 2] },
+        { $multiply: ['$shareCount', 3] }
+      ] } } },
+      { $sort: { engagementScore: -1 } },
+      { $limit: 5 },
+      { $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        as: 'author'
+      } },
+      { $unwind: '$author' },
+      { $project: {
+        _id: 1,
+        content: 1,
+        type: 1,
+        images: 1,
+        videos: 1,
+        engagementScore: 1,
+        createdAt: 1,
+        'author._id': 1,
+        'author.firstName': 1,
+        'author.lastName': 1,
+        'author.profilePicture': 1
+      } }
+    ]);
+    
+    // Get trending events
+    const trendingEvents = await Event.aggregate([
+      { $match: { ...timeQuery, ...locationQuery, ...categoryQuery } },
+      { $addFields: { attendeeCount: { $size: '$attendees' } } },
+      { $sort: { attendeeCount: -1 } },
+      { $limit: 5 },
+      { $lookup: {
+        from: 'users',
+        localField: 'creator',
+        foreignField: '_id',
+        as: 'creator'
+      } },
+      { $unwind: '$creator' },
+      { $project: {
+        _id: 1,
+        title: 1,
+        description: 1,
+        eventType: 1,
+        category: 1,
+        startDate: 1,
+        endDate: 1,
+        location: 1,
+        attendeeCount: 1,
+        'creator._id': 1,
+        'creator.firstName': 1,
+        'creator.lastName': 1,
+        'creator.profilePicture': 1
+      } }
+    ]);
+    
+    // Get active discussions (posts with most comments)
+    const activeDiscussions = await Post.aggregate([
+      { $match: { ...timeQuery, ...locationQuery } },
+      { $addFields: { commentCount: { $size: '$comments' } } },
+      { $sort: { commentCount: -1 } },
+      { $limit: 5 },
+      { $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        as: 'author'
+      } },
+      { $unwind: '$author' },
+      { $project: {
+        _id: 1,
+        content: 1,
+        commentCount: 1,
+        createdAt: 1,
+        'author._id': 1,
+        'author.firstName': 1,
+        'author.lastName': 1,
+        'author.profilePicture': 1
+      } }
+    ]);
+    
+    res.json({
+      trendingHashtags,
+      trendingPosts,
+      trendingEvents,
+      activeDiscussions,
+      period,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    console.error('Trending content error:', error);
+    res.status(500).json({ error: 'Error fetching trending content' });
+  }
+});
+
+// ----------------------
+// PROFILE ENHANCEMENT ENDPOINTS
+// ----------------------
+
+// Skills endorsement system
+app.post('/api/users/:userId/endorse', authenticateToken, async (req, res) => {
+  try {
+    const { skillName } = req.body;
+    
+    if (!skillName) {
+      return res.status(400).json({ error: 'Skill name is required' });
+    }
+    
+    // Verify user exists
+    const targetUser = await User.findById(req.params.userId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if user is endorsing themselves
+    if (targetUser._id.toString() === req.user.id) {
+      return res.status(400).json({ error: 'You cannot endorse your own skills' });
+    }
+    
+    // Find the skill
+    const skillIndex = targetUser.skills.findIndex(
+      skill => skill.name.toLowerCase() === skillName.toLowerCase()
+    );
+    
+    if (skillIndex === -1) {
+      return res.status(404).json({ error: 'Skill not found' });
+    }
+    
+    // Check if user has already endorsed this skill
+    if (!targetUser.skills[skillIndex].endorsements) {
+      targetUser.skills[skillIndex].endorsements = 0;
+    }
+    
+    if (!targetUser.skills[skillIndex].endorsedBy) {
+      targetUser.skills[skillIndex].endorsedBy = [];
+    }
+    
+    const alreadyEndorsed = targetUser.skills[skillIndex].endorsedBy.some(
+      id => id.toString() === req.user.id
+    );
+    
+    if (alreadyEndorsed) {
+      // Remove endorsement (toggle)
+      targetUser.skills[skillIndex].endorsements--;
+      targetUser.skills[skillIndex].endorsedBy = targetUser.skills[skillIndex].endorsedBy.filter(
+        id => id.toString() !== req.user.id
+      );
+    } else {
+      // Add endorsement
+      targetUser.skills[skillIndex].endorsements++;
+      targetUser.skills[skillIndex].endorsedBy.push(req.user.id);
+      
+      // Create notification
+      const currentUser = await User.findById(req.user.id)
+        .select('firstName lastName');
+        
+      await createNotification({
+        recipient: targetUser._id,
+        sender: req.user.id,
+        type: 'endorsement',
+        contentType: 'skill',
+        contentId: targetUser._id,
+        text: `${currentUser.firstName} ${currentUser.lastName} endorsed you for ${skillName}`,
+        actionUrl: `/profile/${targetUser._id}`
+      });
+    }
+    
+    // Sort skills by endorsement count (descending)
+    targetUser.skills.sort((a, b) => (b.endorsements || 0) - (a.endorsements || 0));
+    
+    await targetUser.save();
+    
+    res.json({
+      success: true,
+      skill: targetUser.skills[skillIndex],
+      endorsed: !alreadyEndorsed
+    });
+  }  catch (error) {
+    console.error('Skill endorsement error:', error);
+    res.status(500).json({ error: 'Error endorsing skill' });
+  }
+});
+
+// Recommendation system
+app.post('/api/users/:userId/recommend', authenticateToken, async (req, res) => {
+  try {
+    const { relationship, content, skills } = req.body;
+    
+    if (!relationship || !content) {
+      return res.status(400).json({ error: 'Relationship and content are required' });
+    }
+    
+    // Check if target user exists
+    const targetUser = await User.findById(req.params.userId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if user is trying to recommend themselves
+    if (targetUser._id.toString() === req.user.id) {
+      return res.status(400).json({ error: 'You cannot write a recommendation for yourself' });
+    }
+    
+    // Check if already recommended
+    const existingRecommendation = await Recommendation.findOne({
+      author: req.user.id,
+      recipient: targetUser._id
+    });
+    
+    if (existingRecommendation) {
+      return res.status(400).json({ 
+        error: 'You have already recommended this user',
+        recommendation: existingRecommendation
+      });
+    }
+    
+    // Create the recommendation (pending approval by recipient)
+    const recommendation = await Recommendation.create({
+      author: req.user.id,
+      recipient: targetUser._id,
+      relationship,
+      content,
+      skills: skills || [],
+      status: 'pending',
+      createdAt: new Date()
+    });
+    
+    // Notify recipient
+    const currentUser = await User.findById(req.user.id)
+      .select('firstName lastName profilePicture');
+      
+    await createNotification({
+      recipient: targetUser._id,
+      sender: req.user.id,
+      type: 'recommendation',
+      contentType: 'recommendation',
+      contentId: recommendation._id,
+      text: `${currentUser.firstName} ${currentUser.lastName} wrote you a recommendation`,
+      actionUrl: `/recommendations/${recommendation._id}`
+    });
+    
+    // Return with author details
+    const populatedRecommendation = await Recommendation.findById(recommendation._id)
+      .populate('author', 'firstName lastName profilePicture headline');
+    
+    res.status(201).json(populatedRecommendation);
+  } catch (error) {
+    console.error('Recommendation creation error:', error);
+    res.status(500).json({ error: 'Error creating recommendation' });
+  }
+});
+
+// Manage pending recommendations (approve, decline, edit)
+app.put('/api/recommendations/:recommendationId', authenticateToken, async (req, res) => {
+  try {
+    const { status, featured, content } = req.body;
+    
+    const recommendation = await Recommendation.findById(req.params.recommendationId);
+    if (!recommendation) {
+      return res.status(404).json({ error: 'Recommendation not found' });
+    }
+    
+    // Check permissions - recipient can approve/decline/feature, author can edit content
+    const isRecipient = recommendation.recipient.toString() === req.user.id;
+    const isAuthor = recommendation.author.toString() === req.user.id;
+    
+    if (!isRecipient && !isAuthor) {
+      return res.status(403).json({ error: 'Not authorized to modify this recommendation' });
+    }
+    
+    // Handle status changes (recipient only)
+    if (status && isRecipient) {
+      if (!['approved', 'declined', 'hidden'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
+      }
+      
+      recommendation.status = status;
+    }
+    
+    // Handle featuring (recipient only)
+    if (featured !== undefined && isRecipient) {
+      recommendation.featured = Boolean(featured);
+    }
+    
+    // Handle content update (author only, and only if pending)
+    if (content && isAuthor && recommendation.status === 'pending') {
+      recommendation.content = content;
+      recommendation.updatedAt = new Date();
+    }
+    
+    await recommendation.save();
+    
+    // If status changed to approved, notify author
+    if (status === 'approved' && isRecipient) {
+      const recipient = await User.findById(req.user.id)
+        .select('firstName lastName');
+        
+      await createNotification({
+        recipient: recommendation.author,
+        sender: req.user.id,
+        type: 'recommendation_approved',
+        contentType: 'recommendation',
+        contentId: recommendation._id,
+        text: `${recipient.firstName} ${recipient.lastName} approved your recommendation`,
+        actionUrl: `/profile/${recommendation.recipient}`
+      });
+    }
+    
+    // Return populated recommendation
+    const populatedRecommendation = await Recommendation.findById(recommendation._id)
+      .populate('author', 'firstName lastName profilePicture headline')
+      .populate('recipient', 'firstName lastName profilePicture headline');
+    
+    res.json(populatedRecommendation);
+  } catch (error) {
+    console.error('Recommendation update error:', error);
+    res.status(500).json({ error: 'Error updating recommendation' });
+  }
+});
+
+// ----------------------
+// GROUPS & COMMUNITIES
+// ----------------------
+
+// Create group/community
+app.post('/api/groups', authenticateToken, upload.single('coverImage'), async (req, res) => {
+  try {
+    const {
+      name, description, type, category, tags,
+      isPrivate, requiresApproval, location
+    } = req.body;
+    
+    if (!name || !description || !type) {
+      return res.status(400).json({ error: 'Name, description and type are required' });
+    }
+    
+    // Process location if provided
+    let locationData = {};
+    if (location) {
+      try {
+        locationData = typeof location === 'string' ? JSON.parse(location) : location;
+      } catch (e) {
+        console.error('Error parsing location:', e);
+        locationData = {};
+      }
+    }
+    
+    // Create group
+    const group = await Group.create({
+      name,
+      description,
+      type, // professional, interest, location-based, alumni, etc.
+      category,
+      tags: tags ? (typeof tags === 'string' ? tags.split(',') : tags) : [],
+      coverImage: req.file ? req.file.path : null,
+      isPrivate: isPrivate === 'true' || isPrivate === true,
+      requiresApproval: requiresApproval === 'true' || requiresApproval === true,
+      location: locationData,
+      creator: req.user.id,
+      admins: [req.user.id],
+      members: [{ 
+        user: req.user.id, 
+        role: 'admin', 
+        joinedAt: new Date() 
+      }],
+      createdAt: new Date()
+    });
+    
+    // Update hashtags if there are tags
+    if (tags) {
+      const tagsArray = typeof tags === 'string' ? tags.split(',') : tags;
+      await updateHashtags(tagsArray, 'group');
+    }
+    
+    // Return populated group
+    const populatedGroup = await Group.findById(group._id)
+      .populate('creator', 'firstName lastName profilePicture headline')
+      .populate('members.user', 'firstName lastName profilePicture headline');
+    
+    res.status(201).json(populatedGroup);
+  } catch (error) {
+    console.error('Group creation error:', error);
+    res.status(500).json({ error: 'Error creating group' });
+  }
+});
+
+// Join, leave, or request to join group
+app.post('/api/groups/:groupId/membership', authenticateToken, async (req, res) => {
+  try {
+    const { action, message } = req.body;
+    
+    if (!['join', 'leave', 'request'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+    
+    const group = await Group.findById(req.params.groupId);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    
+    // Check if user is already a member
+    const isMember = group.members.some(member => 
+      member.user.toString() === req.user.id
+    );
+    
+    // Check if user has a pending request
+    const hasPendingRequest = group.membershipRequests && group.membershipRequests.some(
+      request => request.user.toString() === req.user.id && request.status === 'pending'
+    );
+    
+    if (action === 'join') {
+      if (isMember) {
+        return res.status(400).json({ error: 'Already a member of this group' });
+      }
+      
+      if (hasPendingRequest) {
+        return res.status(400).json({ error: 'You already have a pending request to join' });
+      }
+      
+      // If group requires approval, create request
+      if (group.requiresApproval) {
+        if (!group.membershipRequests) {
+          group.membershipRequests = [];
+        }
+        
+        group.membershipRequests.push({
+          user: req.user.id,
+          message: message || '',
+          requestedAt: new Date(),
+          status: 'pending'
+        });
+        
+        // Notify group admins
+        for (const member of group.members.filter(m => m.role === 'admin')) {
+          await createNotification({
+            recipient: member.user,
+            sender: req.user.id,
+            type: 'group_join_request',
+            contentType: 'group',
+            contentId: group._id,
+            text: `${(await User.findById(req.user.id)).firstName} ${(await User.findById(req.user.id)).lastName} requested to join ${group.name}`,
+            actionUrl: `/groups/${group._id}/requests`
+          });
+        }
+        
+        await group.save();
+        
+        return res.json({
+          success: true,
+          status: 'pending',
+          message: 'Join request submitted and pending approval'
+        });
+      } 
+      // No approval required, join directly
+      else {
+        group.members.push({
+          user: req.user.id,
+          role: 'member',
+          joinedAt: new Date()
+        });
+        
+        await group.save();
+        
+        return res.json({
+          success: true,
+          status: 'joined',
+          message: 'Successfully joined group'
+        });
+      }
+    }
+    else if (action === 'leave') {
+      if (!isMember) {
+        return res.status(400).json({ error: 'Not a member of this group' });
+      }
+      
+      // Check if user is the only admin
+      const isAdmin = group.members.some(member => 
+        member.user.toString() === req.user.id && member.role === 'admin'
+      );
+      
+      const adminCount = group.members.filter(member => member.role === 'admin').length;
+      
+      if (isAdmin && adminCount === 1) {
+        return res.status(400).json({ 
+          error: 'Cannot leave group as you are the only admin. Transfer admin role first or delete the group.' 
+        });
+      }
+      
+      // Remove user from members
+      group.members = group.members.filter(member => 
+        member.user.toString() !== req.user.id
+      );
+      
+      await group.save();
+      
+      return res.json({
+        success: true,
+        status: 'left',
+        message: 'Successfully left group'
+      });
+    }
+    else if (action === 'request') {
+      if (isMember) {
+        return res.status(400).json({ error: 'Already a member of this group' });
+      }
+      
+      if (hasPendingRequest) {
+        return res.status(400).json({ error: 'You already have a pending request to join' });
+      }
+      
+      if (!group.membershipRequests) {
+        group.membershipRequests = [];
+      }
+      
+      group.membershipRequests.push({
+        user: req.user.id,
+        message: message || '',
+        requestedAt: new Date(),
+        status: 'pending'
+      });
+      
+      // Notify group admins
+      for (const member of group.members.filter(m => m.role === 'admin')) {
+        await createNotification({
+          recipient: member.user,
+          sender: req.user.id,
+          type: 'group_join_request',
+          contentType: 'group',
+          contentId: group._id,
+          text: `${(await User.findById(req.user.id)).firstName} ${(await User.findById(req.user.id)).lastName} requested to join ${group.name}`,
+          actionUrl: `/groups/${group._id}/requests`
+        });
+      }
+      
+      await group.save();
+      
+      return res.json({
+        success: true,
+        status: 'pending',
+        message: 'Join request submitted and pending approval'
+      });
+    }
+  } catch (error) {
+    console.error('Group membership action error:', error);
+    res.status(500).json({ error: 'Error processing group membership action' });
+  }
+});
+
+// Review membership requests (for admins)
+app.put('/api/groups/:groupId/requests/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { status } = req.body;
+    
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    
+    const group = await Group.findById(req.params.groupId);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    
+    // Check if user is an admin
+    const isAdmin = group.members.some(member => 
+      member.user.toString() === req.user.id && member.role === 'admin'
+    );
+    
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only group admins can review membership requests' });
+    }
+    
+    // Find the request
+    if (!group.membershipRequests) {
+      return res.status(404).json({ error: 'No membership requests found' });
+    }
+    
+    const requestIndex = group.membershipRequests.findIndex(
+      request => request.user.toString() === req.params.userId && request.status === 'pending'
+    );
+    
+    if (requestIndex === -1) {
+      return res.status(404).json({ error: 'Membership request not found' });
+    }
+    
+    // Update request status
+    group.membershipRequests[requestIndex].status = status;
+    group.membershipRequests[requestIndex].reviewedBy = req.user.id;
+    group.membershipRequests[requestIndex].reviewedAt = new Date();
+    
+    // If approved, add user to members
+    if (status === 'approved') {
+      group.members.push({
+        user: group.membershipRequests[requestIndex].user,
+        role: 'member',
+        joinedAt: new Date()
+      });
+    }
+    
+    await group.save();
+    
+    // Notify the requester
+    const requester = await User.findById(req.params.userId);
+    const reviewer = await User.findById(req.user.id);
+    
+    await createNotification({
+      recipient: req.params.userId,
+      sender: req.user.id,
+      type: status === 'approved' ? 'group_request_approved' : 'group_request_rejected',
+      contentType: 'group',
+      contentId: group._id,
+      text: status === 'approved' 
+        ? `Your request to join ${group.name} was approved` 
+        : `Your request to join ${group.name} was declined`,
+      actionUrl: `/groups/${group._id}`
+    });
+    
+    res.json({
+      success: true,
+      status,
+      request: group.membershipRequests[requestIndex]
+    });
+  } catch (error) {
+    console.error('Review membership request error:', error);
+    res.status(500).json({ error: 'Error reviewing membership request' });
+  }
+});
+
+// Create group post
+app.post('/api/groups/:groupId/posts', authenticateToken, upload.array('media', 10), async (req, res) => {
+  try {
+    const {
+      content,
+      type,
+      pollData,
+      linkUrl
+    } = req.body;
+    
+    const group = await Group.findById(req.params.groupId);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    
+    // Check if user is a member
+    const isMember = group.members.some(member => 
+      member.user.toString() === req.user.id
+    );
+    
+    if (!isMember) {
+      return res.status(403).json({ error: 'Only group members can create posts' });
+    }
+    
+    // Determine post type
+    let postType = type || 'text';
+    if (!type) {
+      if (req.files && req.files.length > 0) {
+        postType = req.files[0].mimetype.startsWith('image/') ? 'image' : 'video';
+      } else if (linkUrl) {
+        postType = 'link';
+      } else if (pollData) {
+        postType = 'poll';
+      }
+    }
+    
+    // Process media files
+    let images = [];
+    let videos = [];
+    
+    if (req.files && req.files.length > 0) {
+      req.files.forEach((file, index) => {
+        if (file.mimetype.startsWith('image/')) {
+          images.push({
+            url: file.path,
+            order: index
+          });
+        } else if (file.mimetype.startsWith('video/')) {
+          videos.push({
+            url: file.path,
+            thumbnail: ''
+          });
+        }
+      });
+    }
+    
+    // Process poll data if provided
+    let processedPollData = null;
+    if (pollData) {
+      try {
+        const parsed = typeof pollData === 'string' ? JSON.parse(pollData) : pollData;
+        
+        if (parsed.question && parsed.options && Array.isArray(parsed.options)) {
+          processedPollData = {
+            question: parsed.question,
+            options: parsed.options.map(option => ({
+              text: option,
+              votes: []
+            })),
+            expiresAt: parsed.expiresAt 
+              ? new Date(parsed.expiresAt) 
+              : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 1 week
+            allowMultipleVotes: parsed.allowMultipleVotes || false
+          };
+        }
+      } catch (error) {
+        console.error('Error parsing poll data:', error);
+      }
+    }
+    
+    // Create group post
+    const post = await GroupPost.create({
+      group: group._id,
+      author: req.user.id,
+      content: content || '',
+      type: postType,
+      images,
+      videos,
+      pollData: processedPollData,
+      linkUrl,
+      createdAt: new Date()
+    });
+    
+    // Populate and return
+    const populatedPost = await GroupPost.findById(post._id)
+      .populate('author', 'firstName lastName profilePicture headline')
+      .populate('group', 'name');
+    
+    // Notify group members (optional - could be too noisy for large groups)
+    if (group.members.length < 100) { // Only for smaller groups
+      for (const member of group.members) {
+        if (member.user.toString() !== req.user.id) { // Don't notify the author
+          await createNotification({
+            recipient: member.user,
+            sender: req.user.id,
+            type: 'group_post',
+            contentType: 'group_post',
+            contentId: post._id,
+            text: `${(await User.findById(req.user.id)).firstName} posted in ${group.name}`,
+            actionUrl: `/groups/${group._id}/posts/${post._id}`
+          });
+        }
+      }
+    }
+    
+    res.status(201).json(populatedPost);
+  } catch (error) {
+    console.error('Group post creation error:', error);
+    res.status(500).json({ error: 'Error creating group post' });
+  }
+});
+
+// ----------------------
+// ADVANCED MAP NETWORKING FEATURES
+// ----------------------
+
+// Get nearby events
+app.get('/api/map/events', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      latitude, longitude, radius = 10, // km
+      startDate, endDate, categories = [],
+      page = 1, limit = 20
+    } = req.query;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location coordinates required' });
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build query
+    let query = {
+      'location.coordinates': {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          },
+          $maxDistance: parseInt(radius) * 1000 // Convert km to meters
+        }
+      },
+      // Only show events the user has permission to see
+      $or: [
+        { privacy: 'public' },
+        { privacy: 'connections', creator: { $in: (await User.findById(req.user.id)).connections || [] } },
+        { creator: req.user.id }
+      ],
+      // Default to upcoming events
+      startDate: { $gte: new Date() }
+    };
+    
+    // Add date filters if provided
+    if (startDate) {
+      query.startDate = { $gte: new Date(startDate) };
+    }
+    
+    if (endDate) {
+      query.endDate = { $lte: new Date(endDate) };
+    }
+    
+    // Add category filter if provided
+    if (categories.length > 0) {
+      const categoriesArray = typeof categories === 'string' ? categories.split(',') : categories;
+      query.category = { $in: categoriesArray };
+    }
+    
+    // Execute query
+    const events = await Event.find(query)
+      .populate('creator', 'firstName lastName profilePicture headline')
+      .sort({ startDate: 1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count
+    const total = await Event.countDocuments(query);
+    
+    // Add distance calculation
+    const eventsWithDistance = events.map(event => {
+      let distance = 0;
+      
+      if (event.location && event.location.coordinates) {
+        distance = getDistanceFromLatLonInKm(
+          parseFloat(latitude),
+          parseFloat(longitude),
+          event.location.coordinates[1],
+          event.location.coordinates[0]
+        );
+      }
+      
+      // Add attendance status
+      const userAttendance = event.attendees.find(a => a.user.toString() === req.user.id);
+      
+      return {
+        ...event.toObject(),
+        distance: parseFloat(distance.toFixed(2)),
+        userAttendance: userAttendance ? userAttendance.status : null
+      };
+    });
+    
+    res.json({
+      events: eventsWithDistance,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Map events error:', error);
+    res.status(500).json({ error: 'Error fetching nearby events' });
+  }
+});
+
+// Get nearby groups and communities
+app.get('/api/map/groups', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      latitude, longitude, radius = 10, // km
+      types = [], categories = [],
+      page = 1, limit = 20
+    } = req.query;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location coordinates required' });
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build query
+    let query = {
+      'location.coordinates': {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          },
+          $maxDistance: parseInt(radius) * 1000 // Convert km to meters
+        }
+      },
+      // Only show public groups or ones user is a member of
+      $or: [
+        { isPrivate: false },
+        { 'members.user': req.user.id }
+      ]
+    };
+    
+    // Add type filter if provided
+    if (types.length > 0) {
+      const typesArray = typeof types === 'string' ? types.split(',') : types;
+      query.type = { $in: typesArray };
+    }
+    
+    // Add category filter if provided
+    if (categories.length > 0) {
+      const categoriesArray = typeof categories === 'string' ? categories.split(',') : categories;
+      query.category = { $in: categoriesArray };
+    }
+    
+    // Execute query
+    const groups = await Group.find(query)
+      .populate('creator', 'firstName lastName profilePicture')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count
+    const total = await Group.countDocuments(query);
+    
+    // Add distance calculation and membership status
+    const groupsWithInfo = groups.map(group => {
+      let distance = 0;
+      
+      if (group.location && group.location.coordinates) {
+        distance = getDistanceFromLatLonInKm(
+          parseFloat(latitude),
+          parseFloat(longitude),
+          group.location.coordinates[1],
+          group.location.coordinates[0]
+        );
+      }
+      
+      const membership = {
+        isMember: group.members.some(m => m.user.toString() === req.user.id),
+        role: group.members.find(m => m.user.toString() === req.user.id)?.role || null,
+        hasPendingRequest: group.membershipRequests?.some(
+          r => r.user.toString() === req.user.id && r.status === 'pending'
+        ) || false
+      };
+      
+      return {
+        ...group.toObject(),
+        distance: parseFloat(distance.toFixed(2)),
+        memberCount: group.members.length,
+        membership
+      };
+    });
+    
+    res.json({
+      groups: groupsWithInfo,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Map groups error:', error);
+    res.status(500).json({ error: 'Error fetching nearby groups' });
+  }
+});
+
+// Get nearby job opportunities
+app.get('/api/map/jobs', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      latitude, longitude, radius = 10, // km
+      jobTypes = [], experienceLevels = [], industries = [],
+      remote = false, 
+      page = 1, limit = 20
+    } = req.query;
+    
+    if (!latitude || !longitude && !remote) {
+      return res.status(400).json({ error: 'Location coordinates required for local jobs' });
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Build query
+    let query = {
+      active: true
+    };
+    
+    // Add location filter unless looking for remote jobs
+    if (remote !== 'true' && remote !== true) {
+      query['location.coordinates'] = {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          },
+          $maxDistance: parseInt(radius) * 1000 // Convert km to meters
+        }
+      };
+    } else {
+      // For remote jobs, filter by remote flag
+      query['location.remote'] = true;
+    }
+    
+    // Add filters
+    if (jobTypes.length > 0) {
+      const jobTypesArray = typeof jobTypes === 'string' ? jobTypes.split(',') : jobTypes;
+      query.jobType = { $in: jobTypesArray };
+    }
+    
+    if (experienceLevels.length > 0) {
+      const levelsArray = typeof experienceLevels === 'string' ? experienceLevels.split(',') : experienceLevels;
+      query.experienceLevel = { $in: levelsArray };
+    }
+    
+    if (industries.length > 0) {
+      const industriesArray = typeof industries === 'string' ? industries.split(',') : industries;
+      query.industry = { $in: industriesArray };
+    }
+    
+    // Get user skills for recommendations
+    const user = await User.findById(req.user.id);
+    const userSkills = user.skills ? user.skills.map(s => s.name) : [];
+    
+    // Execute query
+    const jobs = await Job.find(query)
+      .populate('creator', 'firstName lastName profilePicture headline')
+      .populate('company.companyId', 'name logo')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+      
+    // Get total count
+    const total = await Job.countDocuments(query);
+    
+    // Calculate skill match and distance
+    const jobsWithInfo = jobs.map(job => {
+      let distance = 0;
+      let skillMatch = 0;
+      
+      // Calculate distance if job has coordinates
+      if (!remote && job.location && job.location.coordinates) {
+        distance = getDistanceFromLatLonInKm(
+          parseFloat(latitude),
+          parseFloat(longitude),
+          job.location.coordinates[1],
+          job.location.coordinates[0]
+        );
+      }
+      
+      // Calculate skill match percentage
+      if (userSkills.length > 0 && job.skills && job.skills.length > 0) {
+        const matchingSkills = job.skills.filter(skill => 
+          userSkills.includes(skill)
+        );
+        
+        skillMatch = Math.round((matchingSkills.length / job.skills.length) * 100);
+      }
+      
+      return {
+        ...job.toObject(),
+        distance: parseFloat(distance.toFixed(2)),
+        skillMatch
+      };
+    });
+    
+    // Sort by skill match if skills available, otherwise keep chronological
+    if (userSkills.length > 0) {
+      jobsWithInfo.sort((a, b) => b.skillMatch - a.skillMatch);
+    }
+    
+    res.json({
+      jobs: jobsWithInfo,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Map jobs error:', error);
+    res.status(500).json({ error: 'Error fetching nearby jobs' });
+  }
+});
+
+// ----------------------
+// REAL-TIME LOCATION SHARING AND TRACKING
+// ----------------------
+
+// Enable/disable real-time location sharing
+app.post('/api/location/sharing', authenticateToken, async (req, res) => {
+  try {
+    const { enabled, duration, visibleTo } = req.body;
+    
+    // Update user's location sharing settings
+    const updateData = {
+      'locationSharing.enabled': enabled === true || enabled === 'true'
+    };
+    
+    // Set expiration if duration provided
+    if (duration) {
+      const expiresAt = new Date();
+      expiresAt.setMinutes(expiresAt.getMinutes() + parseInt(duration));
+      updateData['locationSharing.expiresAt'] = expiresAt;
+    } else if (enabled) {
+      // Default to 1 hour if enabled without duration
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 1);
+      updateData['locationSharing.expiresAt'] = expiresAt;
+    }
+    
+    // Set visibility settings
+    if (visibleTo) {
+      updateData['locationSharing.visibleTo'] = visibleTo; // 'connections', 'everyone', 'selected'
+    }
+    
+    // If sharing with selected users, update the list
+    if (visibleTo === 'selected' && req.body.selectedUsers) {
+      let selectedUsers;
+      try {
+        selectedUsers = typeof req.body.selectedUsers === 'string' 
+          ? JSON.parse(req.body.selectedUsers) 
+          : req.body.selectedUsers;
+      } catch (e) {
+        console.error('Error parsing selectedUsers:', e);
+        selectedUsers = [];
+      }
+      
+      updateData['locationSharing.selectedUsers'] = selectedUsers;
+    }
+    
+    // Update user
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user.id,
+      { $set: updateData },
+      { new: true }
+    );
+    
+    // Notify connections if enabled
+    if (enabled === true || enabled === 'true') {
+      // Get user's connections
+      const connectionIds = updatedUser.connections || [];
+      
+      // Filter based on visibility settings
+      let notifyUserIds = [];
+      
+      if (visibleTo === 'connections') {
+        notifyUserIds = connectionIds;
+      } else if (visibleTo === 'selected' && updateData['locationSharing.selectedUsers']) {
+        notifyUserIds = updateData['locationSharing.selectedUsers'];
+      }
+      
+      // Send notifications
+      for (const userId of notifyUserIds) {
+        await createNotification({
+          recipient: userId,
+          sender: req.user.id,
+          type: 'location_sharing',
+          contentType: 'user',
+          contentId: req.user.id,
+          text: `${updatedUser.firstName} ${updatedUser.lastName} is sharing their location with you`,
+          actionUrl: `/map/users/${req.user.id}`
+        });
+      }
+      
+      // Emit socket event for real-time updates
+      io.to(notifyUserIds.map(id => `user_${id}`)).emit('location_sharing_enabled', {
+        userId: req.user.id,
+        name: `${updatedUser.firstName} ${updatedUser.lastName}`,
+        expiresAt: updateData['locationSharing.expiresAt']
+      });
+    }
+    
+    res.json({
+      success: true,
+      locationSharing: {
+        enabled: updateData['locationSharing.enabled'],
+        expiresAt: updateData['locationSharing.expiresAt'],
+        visibleTo: updateData['locationSharing.visibleTo'],
+        selectedUsers: updateData['locationSharing.selectedUsers']
+      }
+    });
+  } catch (error) {
+    console.error('Location sharing settings error:', error);
+    res.status(500).json({ error: 'Error updating location sharing settings' });
+  }
+});
+
+// Update real-time location
+app.post('/api/location/update', authenticateToken, async (req, res) => {
+  try {
+    const { latitude, longitude, accuracy, heading, speed } = req.body;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Coordinates required' });
+    }
+    
+    // Check if user has location sharing enabled
+    const user = await User.findById(req.user.id);
+    
+    if (!user.locationSharing || !user.locationSharing.enabled) {
+      return res.status(403).json({ error: 'Location sharing is not enabled' });
+    }
+    
+    // Check if sharing has expired
+    if (user.locationSharing.expiresAt && user.locationSharing.expiresAt < new Date()) {
+      // Auto-disable expired sharing
+      await User.findByIdAndUpdate(req.user.id, {
+        $set: { 'locationSharing.enabled': false }
+      });
+      
+      return res.status(403).json({ 
+        error: 'Location sharing has expired',
+        expired: true
+      });
+    }
+    
+    // Update location in database
+    const locationUpdate = {
+      'location.coordinates': [parseFloat(longitude), parseFloat(latitude)],
+      'location.accuracy': accuracy ? parseFloat(accuracy) : undefined,
+      'location.heading': heading ? parseFloat(heading) : undefined,
+      'location.speed': speed ? parseFloat(speed) : undefined,
+      'location.lastUpdated': new Date()
+    };
+    
+    // Only update fields that are provided
+    Object.keys(locationUpdate).forEach(key => {
+      if (locationUpdate[key] === undefined) {
+        delete locationUpdate[key];
+      }
+    });
+    
+    await User.findByIdAndUpdate(req.user.id, { $set: locationUpdate });
+    
+    // Determine which users can see this update
+    let visibleToUserIds = [];
+    
+    if (user.locationSharing.visibleTo === 'connections') {
+      visibleToUserIds = user.connections || [];
+    } else if (user.locationSharing.visibleTo === 'selected') {
+      visibleToUserIds = user.locationSharing.selectedUsers || [];
+    }
+    
+    // Emit socket event with location update
+    io.to(visibleToUserIds.map(id => `user_${id}`)).emit('location_update', {
+      userId: req.user.id,
+      name: `${user.firstName} ${user.lastName}`,
+      location: {
+        coordinates: [parseFloat(longitude), parseFloat(latitude)],
+        accuracy: accuracy ? parseFloat(accuracy) : null,
+        heading: heading ? parseFloat(heading) : null,
+        speed: speed ? parseFloat(speed) : null,
+        lastUpdated: new Date()
+      }
+    });
+    
+    res.json({
+      success: true,
+      location: {
+        coordinates: [parseFloat(longitude), parseFloat(latitude)],
+        accuracy: accuracy ? parseFloat(accuracy) : null,
+        lastUpdated: new Date()
+      }
+    });
+  } catch (error) {
+    console.error('Location update error:', error);
+    res.status(500).json({ error: 'Error updating location' });
+  }
+});
+
+// Get users with shared location
+app.get('/api/location/shared-users', authenticateToken, async (req, res) => {
+  try {
+    // Find users who are sharing location with the current user
+    const sharedUsers = await User.find({
+      $and: [
+        { 'locationSharing.enabled': true },
+        { 'locationSharing.expiresAt': { $gt: new Date() } },
+        { 
+          $or: [
+            { 
+              'locationSharing.visibleTo': 'connections',
+              connections: req.user.id
+            },
+            {
+              'locationSharing.visibleTo': 'selected',
+              'locationSharing.selectedUsers': req.user.id
+            },
+            {
+              'locationSharing.visibleTo': 'everyone'
+            }
+          ]
+        }
+      ]
+    })
+    .select('firstName lastName profilePicture headline location locationSharing.expiresAt');
+    
+    // Add connection status and calculate distance from current user
+    const currentUser = await User.findById(req.user.id);
+    
+    const enhancedUsers = sharedUsers.map(user => {
+      let distance = null;
+      
+      // Calculate distance if both users have coordinates
+      if (currentUser.location?.coordinates && user.location?.coordinates) {
+        distance = getDistanceFromLatLonInKm(
+          currentUser.location.coordinates[1],
+          currentUser.location.coordinates[0],
+          user.location.coordinates[1],
+          user.location.coordinates[0]
+        );
+      }
+      
+      // Check connection status
+      const isConnected = currentUser.connections?.includes(user._id);
+      
+      return {
+        ...user.toObject(),
+        distance: distance !== null ? parseFloat(distance.toFixed(2)) : null,
+        isConnected,
+        sharingExpiresIn: user.locationSharing?.expiresAt
+          ? Math.round((user.locationSharing.expiresAt - new Date()) / 60000) // minutes
+          : null
+      };
+    });
+    
+    res.json({
+      users: enhancedUsers,
+      currentUserSharing: currentUser.locationSharing?.enabled || false,
+      currentUserExpiry: currentUser.locationSharing?.expiresAt
+    });
+  } catch (error) {
+    console.error('Shared users error:', error);
+    res.status(500).json({ error: 'Error fetching location-sharing users' });
+  }
+});
+
+// ----------------------
+// ANALYTICS & REPORTS
+// ----------------------
+
+// Get personal networking analytics
+app.get('/api/analytics/network', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { period = 'month' } = req.query;
+    
+    // Determine date range
+    const now = new Date();
+    let startDate = new Date();
+    
+    switch (period) {
+      case 'week':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case 'month':
+        startDate.setMonth(startDate.getMonth() - 1);
+        break;
+      case 'quarter':
+        startDate.setMonth(startDate.getMonth() - 3);
+        break;
+      case 'year':
+        startDate.setFullYear(startDate.getFullYear() - 1);
+        break;
+      default:
+        startDate.setMonth(startDate.getMonth() - 1); // Default to month
+    }
+    
+    // Get current user data
+    const user = await User.findById(userId);
+    
+    // Calculate growth metrics
+    const networkSize = (user.connections || []).length;
+    const followers = (user.followers || []).length;
+    const following = (user.following || []).length;
+    
+    // Get new connections in time period
+    const recentConnections = await ActivityLog.find({
+      user: userId,
+      activityType: 'connection_added',
+      createdAt: { $gte: startDate, $lte: now }
+    }).countDocuments();
+    
+    // Get profile views in time period
+    const profileViews = await ProfileView.find({
+      profileId: userId,
+      viewedAt: { $gte: startDate, $lte: now }
+    }).countDocuments();
+    
+    // Get unique viewers count
+    const uniqueViewers = await ProfileView.aggregate([
+      { 
+        $match: { 
+          profileId: new mongoose.Types.ObjectId(userId),
+          viewedAt: { $gte: startDate, $lte: now }
+        } 
+      },
+      { $group: { _id: '$viewerId', count: { $sum: 1 } } },
+      { $count: 'total' }
+    ]);
+    
+    const uniqueViewersCount = uniqueViewers.length > 0 ? uniqueViewers[0].total : 0;
+    
+    // Get event attendance
+    const eventsAttended = await Event.find({
+      'attendees.user': userId,
+      'attendees.status': 'going',
+      startDate: { $gte: startDate, $lte: now }
+    }).countDocuments();
+    
+    // Get top skills by endorsements
+    const topSkills = user.skills
+      ? user.skills
+          .filter(skill => skill.endorsements && skill.endorsements > 0)
+          .sort((a, b) => b.endorsements - a.endorsements)
+          .slice(0, 5)
+      : [];
+    
+    // Get connection industries breakdown
+    const connectionIndustries = await User.aggregate([
+      { $match: { _id: { $in: user.connections.map(id => new mongoose.Types.ObjectId(id)) } } },
+      { $group: { _id: '$industry', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 5 }
+    ]);
+    
+    res.json({
+      networkSize,
+      followers,
+      following,
+      growth: {
+        newConnections: recentConnections,
+        period
+      },
+      engagement: {
+        profileViews,
+        uniqueViewers: uniqueViewersCount,
+        eventsAttended
+      },
+      topSkills: topSkills.map(skill => ({
+        name: skill.name,
+        endorsements: skill.endorsements
+      })),
+      industries: connectionIndustries.map(industry => ({
+        name: industry._id || 'Not specified',
+        count: industry.count
+      }))
+    });
+  } catch (error) {
+    console.error('Network analytics error:', error);
+    res.status(500).json({ error: 'Error fetching network analytics' });
+  }
+});
+
+// Get event analytics (for organizers)
+app.get('/api/analytics/events', authenticateToken, async (req, res) => {
+  try {
+    const { period = 'year' } = req.query;
+    
+    // Determine date range
+    const now = new Date();
+    let startDate = new Date();
+    
+    switch (period) {
+      case 'month':
+        startDate.setMonth(startDate.getMonth() - 1);
+        break;
+      case 'quarter':
+        startDate.setMonth(startDate.getMonth() - 3);
+        break;
+      case 'year':
+        startDate.setFullYear(startDate.getFullYear() - 1);
+        break;
+      default:
+        startDate.setFullYear(startDate.getFullYear() - 1); // Default to year
+    }
+    
+    // Find events created by the user
+    const events = await Event.find({
+      creator: req.user.id,
+      createdAt: { $gte: startDate, $lte: now }
+    });
+    
+    // Calculate metrics
+    const totalEvents = events.length;
+    const upcomingEvents = events.filter(e => e.startDate > now).length;
+    const pastEvents = events.filter(e => e.endDate < now).length;
+    
+    // Total attendees
+    const totalAttendees = events.reduce((sum, event) => 
+      sum + event.attendees.filter(a => a.status === 'going').length, 
+    0);
+    
+    // Average attendees per event
+    const avgAttendees = pastEvents > 0 
+      ? Math.round(events
+          .filter(e => e.endDate < now)
+          .reduce((sum, event) => 
+            sum + event.attendees.filter(a => a.status === 'going').length, 
+          0) / pastEvents)
+      : 0;
+    
+    // Check-in rate
+    const checkedInTotal = events
+      .filter(e => e.endDate < now)
+      .reduce((sum, event) => 
+        sum + event.attendees.filter(a => a.checkedIn).length, 
+      0);
+      
+    const goingTotal = events
+      .filter(e => e.endDate < now)
+      .reduce((sum, event) => 
+        sum + event.attendees.filter(a => a.status === 'going').length, 
+      0);
+    
+    const checkInRate = goingTotal > 0 
+      ? Math.round((checkedInTotal / goingTotal) * 100) 
+      : 0;
+    
+    // Popular categories
+    const categoryCounts = {};
+    events.forEach(event => {
+      if (!categoryCounts[event.category]) {
+        categoryCounts[event.category] = 0;
+      }
+      categoryCounts[event.category]++;
+    });
+    
+    const popularCategories = Object.entries(categoryCounts)
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+    
+    // Monthly event counts
+    const monthlyEventCounts = [];
+    const months = [];
+    let currentDate = new Date(startDate);
+    
+    while (currentDate <= now) {
+      const month = currentDate.toLocaleString('default', { month: 'short' });
+      const year = currentDate.getFullYear();
+      const label = `${month} ${year}`;
+      
+      const monthStart = new Date(currentDate);
+      const monthEnd = new Date(currentDate);
+      monthEnd.setMonth(monthEnd.getMonth() + 1);
+      
+      const count = events.filter(e => 
+        e.startDate >= monthStart && e.startDate < monthEnd
+      ).length;
+      
+      monthlyEventCounts.push({ month: label, count });
+      
+      currentDate.setMonth(currentDate.getMonth() + 1);
+    }
+    
+    res.json({
+      eventCounts: {
+        total: totalEvents,
+        upcoming: upcomingEvents,
+        past: pastEvents
+      },
+      attendance: {
+        total: totalAttendees,
+        average: avgAttendees,
+        checkInRate: `${checkInRate}%`
+      },
+      categories: popularCategories,
+      trending: {
+        mostAttended: events
+          .sort((a, b) => 
+            b.attendees.filter(at => at.status === 'going').length - 
+            a.attendees.filter(at => at.status === 'going').length
+          )
+          .slice(0, 3)
+          .map(e => ({
+            id: e._id,
+            title: e.title,
+            attendees: e.attendees.filter(a => a.status === 'going').length,
+            date: e.startDate
+          }))
+      },
+      timeAnalysis: monthlyEventCounts
+    });
+  } catch (error) {
+    console.error('Event analytics error:', error);
+    res.status(500).json({ error: 'Error fetching event analytics' });
+  }
+});
+
+// ----------------------
+// APPLICATION CONFIGURATION & PREFERENCES
+// ----------------------
+
+// Get personalized app settings
+app.get('/api/settings', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id)
+      .select('privacy notificationPreferences');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Get user preferences and default values if not set
+    const settings = {
+      privacy: user.privacy || {
+        profileVisibility: 'public',
+        storyVisibility: 'followers',
+        messagePermission: 'everyone',
+        activityStatus: 'everyone',
+        searchability: true
+      },
+      notifications: user.notificationPreferences || {
+        email: {
+          messages: true,
+          connections: true,
+          mentions: true,
+          events: true,
+          jobs: true,
+          marketing: false
+        },
+        push: {
+          messages: true,
+          connections: true,
+          mentions: true,
+          events: true,
+          jobs: true
+        },
+        inApp: {
+          messages: true,
+          connections: true,
+          mentions: true,
+          events: true,
+          jobs: true
+        }
+      },
+      theme: 'light', // Example of app preference outside user model
+      language: 'en',
+      accessibility: {
+        fontSize: 'medium',
+        highContrast: false,
+        reduceAnimations: false
+      }
+    };
+    
+    res.json(settings);
+  } catch (error) {
+    console.error('Settings fetch error:', error);
+    res.status(500).json({ error: 'Error fetching settings' });
+  }
+});
+
+// Update app settings
+app.put('/api/settings', authenticateToken, async (req, res) => {
+  try {
+    const { privacy, notifications, theme, language, accessibility } = req.body;
+    
+    const updateData = {};
+    
+    // Update privacy settings if provided
+    if (privacy) {
+      updateData.privacy = {};
+      
+      if (privacy.profileVisibility) {
+        updateData.privacy.profileVisibility = privacy.profileVisibility;
+      }
+      
+      if (privacy.storyVisibility) {
+        updateData.privacy.storyVisibility = privacy.storyVisibility;
+      }
+      
+      if (privacy.messagePermission) {
+        updateData.privacy.messagePermission = privacy.messagePermission;
+      }
+      
+      if (privacy.activityStatus !== undefined) {
+        updateData.privacy.activityStatus = privacy.activityStatus;
+      }
+      
+      if (privacy.searchability !== undefined) {
+        updateData.privacy.searchability = privacy.searchability;
+      }
+    }
+    
+    // Update notification preferences if provided
+    if (notifications) {
+      updateData.notificationPreferences = {};
+      
+      if (notifications.email) {
+        updateData.notificationPreferences.email = notifications.email;
+      }
+      
+      if (notifications.push) {
+        updateData.notificationPreferences.push = notifications.push;
+      }
+      
+      if (notifications.inApp) {
+        updateData.notificationPreferences.inApp = notifications.inApp;
+      }
+    }
+    
+    // Update user in database
+    let user;
+    
+    if (Object.keys(updateData).length > 0) {
+      user = await User.findByIdAndUpdate(
+        req.user.id,
+        { $set: updateData },
+        { new: true }
+      ).select('privacy notificationPreferences');
+    } else {
+      user = await User.findById(req.user.id)
+        .select('privacy notificationPreferences');
+    }
+    
+    // Store app preferences in a separate collection or similar
+    // This is an example (not implemented in your model)
+    const appSettings = {
+      theme: theme || 'light',
+      language: language || 'en',
+      accessibility: accessibility || {
+        fontSize: 'medium',
+        highContrast: false,
+        reduceAnimations: false
+      }
+    };
+    
+    // Combine and return all settings
+    const combinedSettings = {
+      privacy: user.privacy,
+      notifications: user.notificationPreferences,
+      ...appSettings
+    };
+    
+    res.json(combinedSettings);
+  } catch (error) {
+    console.error('Settings update error:', error);
+    res.status(500).json({ error: 'Error updating settings' });
+  }
+});
+
+// ----------------------
+// WEBHOOK INTEGRATIONS
+// ----------------------
+
+// Register external webhook
+app.post('/api/webhooks', authenticateToken, async (req, res) => {
+  try {
+    const { url, events, secret } = req.body;
+    
+    if (!url || !events || !Array.isArray(events) || events.length === 0) {
+      return res.status(400).json({ 
+        error: 'URL and at least one event type are required' 
+      });
+    }
+    
+    // Validate URL format
+    if (!url.match(/^https?:\/\/.+/)) {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+    
+    // Validate event types
+    const validEventTypes = [
+      'new_connection', 'new_message', 'event_rsvp', 
+      'profile_view', 'job_application', 'meeting_request'
+    ];
+    
+    const invalidEvents = events.filter(event => !validEventTypes.includes(event));
+    if (invalidEvents.length > 0) {
+      return res.status(400).json({ 
+        error: `Invalid event types: ${invalidEvents.join(', ')}`,
+        validEventTypes
+      });
+    }
+    
+    // Generate webhook ID and signing secret if not provided
+    const webhookId = new mongoose.Types.ObjectId();
+    const signingSecret = secret || crypto.randomBytes(16).toString('hex');
+    
+    // Create webhook
+    const webhook = await Webhook.create({
+      _id: webhookId,
+      user: req.user.id,
+      url,
+      events,
+      signingSecret,
+      createdAt: new Date(),
+      status: 'active'
+    });
+    
+    res.status(201).json({
+      webhookId: webhook._id,
+      url: webhook.url,
+      events: webhook.events,
+      signingSecret,
+      status: webhook.status
+    });
+  } catch (error) {
+    console.error('Webhook creation error:', error);
+    res.status(500).json({ error: 'Error creating webhook' });
+  }
+});
+
+// ----------------------
+// SCHEMA DEFINITIONS FOR NEW ENDPOINTS
+// ----------------------
+
+// Meeting Schema (for in-person networking)
+const meetingSchema = new mongoose.Schema({
+  requester: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  recipient: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'accepted', 'declined', 'rescheduled', 'completed', 'canceled'],
+    default: 'pending'
+  },
+  proposedTime: {
+    type: Date,
+    required: true
+  },
+  proposedLocation: {
+    name: String,
+    address: String,
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      index: '2dsphere'
+    }
+  },
+  alternativeTime: Date,
+  alternativeLocation: {
+    name: String,
+    address: String,
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      index: '2dsphere'
+    }
+  },
+  duration: {
+    type: Number, // in minutes
+    default: 30
+  },
+  message: String,
+  recipientMessage: String,
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Group Schema
+const groupSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true
+  },
+  description: String,
+  type: {
+    type: String,
+    enum: ['professional', 'interest', 'location-based', 'alumni', 'project', 'event', 'other'],
+    required: true
+  },
+  category: String,
+  tags: [String],
+  coverImage: String,
+  isPrivate: {
+    type: Boolean,
+    default: false
+  },
+  requiresApproval: {
+    type: Boolean,
+    default: true
+  },
+  location: {
+    address: String,
+    city: String,
+    country: String,
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      index: '2dsphere'
+    }
+  },
+  creator: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  admins: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
+  members: [{
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    role: {
+      type: String,
+      enum: ['admin', 'moderator', 'member'],
+      default: 'member'
+    },
+    joinedAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  membershipRequests: [{
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    message: String,
+    requestedAt: Date,
+    status: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'pending'
+    },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    reviewedAt: Date
+  }],
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Group Post Schema
+const groupPostSchema = new mongoose.Schema({
+  group: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Group',
+    required: true
+  },
+  author: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  content: String,
+  type: {
+    type: String,
+    enum: ['text', 'image', 'video', 'link', 'poll'],
+    default: 'text'
+  },
+  images: [{
+    url: String,
+    caption: String,
+    order: Number
+  }],
+  videos: [{
+    url: String,
+    thumbnail: String
+  }],
+  linkUrl: String,
+  pollData: {
+    question: String,
+    options: [{
+      text: String,
+      votes: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+      }]
+    }],
+    expiresAt: Date,
+    allowMultipleVotes: Boolean
+  },
+  likes: [{
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  comments: [{
+    author: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true
+    },
+    content: {
+      type: String,
+      required: true
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  isPinned: {
+    type: Boolean,
+    default: false
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date
+  }
+});
+
+// Activity Log Schema
+const activityLogSchema = new mongoose.Schema({
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  activityType: {
+    type: String,
+    enum: [
+      'connection_added', 'connection_removed', 'profile_update',
+      'post_created', 'post_liked', 'post_commented',
+      'event_created', 'event_rsvp', 'event_checkin',
+      'job_applied', 'job_posted', 'group_joined',
+      'group_post', 'project_created', 'recommendation_given',
+      'skill_endorsed', 'location_shared', 'meeting_scheduled'
+    ],
+    required: true
+  },
+  entityType: {
+    type: String,
+    enum: [
+      'user', 'post', 'comment', 'event', 'job', 'group',
+      'project', 'skill', 'recommendation', 'meeting', 'location'
+    ],
+    required: true
+  },
+  entityId: {
+    type: mongoose.Schema.Types.ObjectId,
+    required: true
+  },
+  metadata: {
+    type: mongoose.Schema.Types.Mixed
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  ipAddress: String,
+  userAgent: String
+});
+
+// Webhook Schema
+const webhookSchema = new mongoose.Schema({
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  url: {
+    type: String,
+    required: true
+  },
+  events: [{
+    type: String,
+    enum: [
+      'new_connection', 'new_message', 'event_rsvp', 
+      'profile_view', 'job_application', 'meeting_request',
+      'post_created', 'location_update', 'group_join'
+    ]
+  }],
+  signingSecret: {
+    type: String,
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['active', 'paused', 'error'],
+    default: 'active'
+  },
+  lastTriggered: Date,
+  errorCount: {
+    type: Number,
+    default: 0
+  },
+  lastError: {
+    message: String,
+    code: String,
+    timestamp: Date
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: Date
+});
+
+// Create models for new schemas
+const Meeting = mongoose.model('Meeting', meetingSchema);
+const Group = mongoose.model('Group', groupSchema);
+const GroupPost = mongoose.model('GroupPost', groupPostSchema);
+const ActivityLog = mongoose.model('ActivityLog', activityLogSchema);
+const Webhook = mongoose.model('Webhook', webhookSchema);
+
+// ----------------------
+// ADDITIONAL HELPER METHODS
+// ----------------------
+
+// Socket.io event handlers
+
+// ----------------------
+
+
 // CHAT ROUTES
 // ----------------------
 
@@ -3520,66 +7451,95 @@ app.get('/api/chats', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error fetching chats' });
   }
 });
-const testUpload = multer({ dest: 'uploads/' });
-// Simplified CloudinaryStorage
-const simpleStoryStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'stories',
-    resource_type: 'auto'
-  }
-});
 
-const simpleStoryUpload = multer({ storage: simpleStoryStorage });
-
-app.post('/api/simple-cloudinary-test', simpleStoryUpload.single('media'), (req, res) => {
-  console.log('File received and uploaded to Cloudinary:', req.file);
-  res.json({ 
-    success: true, 
-    message: 'File uploaded to Cloudinary', 
-    file: req.file ? req.file.path : 'No file'
-  });
-});
-app.post('/api/simple-test-upload', storyUpload.single('media'), (req, res) => {
-  console.log('File received:', req.file);
-  res.json({ success: true, message: 'File received' });
-});
-app.post('/api/chats/:chatId/messages', authenticateToken, async (req, res) => {
+// Updated endpoint for sending messages with attachments
+app.post('/api/chats/:chatId/messages', authenticateToken, chatUpload.single('media'), async (req, res) => {
   try {
-    const { content, messageType } = req.body;
+    const { content, messageType, replyTo } = req.body;
     
-    // Validate inputs
-    if (!req.params.chatId) {
-      return res.status(400).json({ error: 'Chat ID is required' });
-    }
-    
+    // Validate chat exists
     const chatRoom = await ChatRoom.findById(req.params.chatId);
     if (!chatRoom) {
       return res.status(404).json({ error: 'Chat room not found' });
     }
 
-    // Handle file uploads if present
-    let mediaUrl = null;
-    if (req.file) {
-      mediaUrl = req.file.path;
+    // Verify user is a participant in this chat
+    if (!chatRoom.participants.some(participant => participant.toString() === req.user.id)) {
+      return res.status(403).json({ error: 'Not authorized to send messages in this chat' });
     }
 
-    const message = await Message.create({
+    // Determine recipient (in direct chats)
+    const recipient = chatRoom.type === 'direct' 
+      ? chatRoom.participants.find(participant => participant.toString() !== req.user.id)
+      : chatRoom.participants[0]; // Default to first participant for group chats
+    
+    // Determine message type based on uploaded file or specified type
+    let finalMessageType = messageType || 'text';
+    let mediaUrl = null;
+    let fileName = null;
+    let fileSize = null;
+    
+    if (req.file) {
+      // A file was uploaded, determine message type from mimetype
+      if (req.file.mimetype.startsWith('image/')) {
+        finalMessageType = 'image';
+      } else if (req.file.mimetype.startsWith('video/')) {
+        finalMessageType = 'video';
+      } else {
+        finalMessageType = 'file';
+      }
+      
+      mediaUrl = req.file.path; // Cloudinary URL
+      fileName = req.file.originalname;
+      fileSize = req.file.size;
+    } else if (!content && finalMessageType !== 'poll' && finalMessageType !== 'location') {
+      // No content and no file, invalid message
+      return res.status(400).json({ error: 'Message must have content or attachment' });
+    }
+    
+    // Create message object
+    const messageData = {
       sender: req.user.id,
-      recipient: chatRoom.participants.find(
-        participantId => participantId.toString() !== req.user.id
-      ),
       chatRoom: req.params.chatId,
-      content,
-      messageType,
-      mediaUrl
-    });
+      recipient,
+      content: content || '',
+      messageType: finalMessageType,
+      mediaUrl,
+      fileName,
+      fileSize
+    };
+    
+    // Add reply reference if provided
+    if (replyTo) {
+      // Verify reply message exists
+      const replyMessage = await Message.findById(replyTo);
+      if (!replyMessage) {
+        return res.status(404).json({ error: 'Reply message not found' });
+      }
+      
+      messageData.replyTo = replyTo;
+    }
+    
+    // Create the message
+    const message = await Message.create(messageData);
 
     // Populate sender and recipient details
     await message.populate('sender', 'firstName lastName profilePicture');
     await message.populate('recipient', 'firstName lastName profilePicture');
+    
+    // If replying to a message, populate that message too
+    if (replyTo) {
+      await message.populate({
+        path: 'replyTo',
+        select: 'content sender messageType mediaUrl',
+        populate: {
+          path: 'sender',
+          select: 'firstName lastName profilePicture'
+        }
+      });
+    }
 
-    // Update chat room's last message
+    // Update chat room's last message and activity
     await ChatRoom.findByIdAndUpdate(req.params.chatId, {
       lastMessage: message._id,
       lastActivity: new Date()
@@ -3587,7 +7547,12 @@ app.post('/api/chats/:chatId/messages', authenticateToken, async (req, res) => {
 
     res.status(201).json(message);
   } catch (error) {
-    console.error('Send message server error:', error);
+    console.error('Send message with attachment error:', error);
+    
+    if (error.message && error.message.includes('File size limit exceeded')) {
+      return res.status(400).json({ error: 'File size exceeded the limit' });
+    }
+    
     res.status(500).json({ 
       error: 'Error sending message', 
       details: error.message 
@@ -3816,7 +7781,432 @@ app.post('/api/chats/:chatId/polls', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error creating poll' });
   }
 });
+// DELETE a message
+app.delete('/api/chats/:chatId/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { chatId, messageId } = req.params;
+    
+    // Check if message exists
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    
+    // Check if user is the sender or has permission to delete
+    if (message.sender.toString() !== req.user.id) {
+      // Check if user is chat admin if it's a group chat
+      const chatRoom = await ChatRoom.findById(chatId);
+      if (!chatRoom || (chatRoom.type === 'group' && chatRoom.admin.toString() !== req.user.id)) {
+        return res.status(403).json({ error: 'Not authorized to delete this message' });
+      }
+    }
+    
+    // Soft delete by marking message as deleted for the user
+    await Message.findByIdAndUpdate(messageId, {
+      $addToSet: { deletedFor: req.user.id }
+    });
+    
+    res.json({ success: true, messageId });
+  } catch (error) {
+    console.error('Delete message error:', error);
+    res.status(500).json({ error: 'Error deleting message' });
+  }
+});
 
+// Add reaction to a message
+app.post('/api/chats/:chatId/messages/:messageId/react', authenticateToken, async (req, res) => {
+  try {
+    const { chatId, messageId } = req.params;
+    const { reaction } = req.body;
+    
+    if (!reaction) {
+      return res.status(400).json({ error: 'Reaction is required' });
+    }
+    
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    
+    // Check if user has already reacted with this reaction
+    const existingReactionIndex = message.reactions.findIndex(
+      r => r.user.toString() === req.user.id && r.reaction === reaction
+    );
+    
+    if (existingReactionIndex !== -1) {
+      // Remove existing reaction (toggle behavior)
+      message.reactions.splice(existingReactionIndex, 1);
+    } else {
+      // Remove any existing reaction by this user
+      message.reactions = message.reactions.filter(
+        r => r.user.toString() !== req.user.id
+      );
+      
+      // Add the new reaction
+      message.reactions.push({
+        user: req.user.id,
+        reaction
+      });
+    }
+    
+    await message.save();
+    
+    res.json({
+      success: true,
+      messageId,
+      userId: req.user.id,
+      reactions: message.reactions
+    });
+  } catch (error) {
+    console.error('React to message error:', error);
+    res.status(500).json({ error: 'Error adding reaction to message' });
+  }
+});
+
+// Remove reaction from a message
+app.delete('/api/chats/:chatId/messages/:messageId/react', authenticateToken, async (req, res) => {
+  try {
+    const { chatId, messageId } = req.params;
+    
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    
+    // Remove any reaction by this user
+    message.reactions = message.reactions.filter(
+      r => r.user.toString() !== req.user.id
+    );
+    
+    await message.save();
+    
+    res.json({
+      success: true,
+      messageId,
+      userId: req.user.id
+    });
+  } catch (error) {
+    console.error('Remove reaction error:', error);
+    res.status(500).json({ error: 'Error removing reaction' });
+  }
+});
+
+// Separate endpoints for audio and video calls
+app.post('/api/calls/:chatId/audio', authenticateToken, async (req, res) => {
+  try {
+    const chatRoom = await ChatRoom.findById(req.params.chatId);
+    
+    if (!chatRoom) {
+      return res.status(404).json({ error: 'Chat room not found' });
+    }
+    
+    // Check if user is a participant
+    const isParticipant = chatRoom.participants.some(
+      participant => participant.toString() === req.user.id
+    );
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Not authorized to initiate call' });
+    }
+    
+    // Create call history entry
+    const callHistory = {
+      initiator: req.user.id,
+      callType: 'audio',
+      startTime: new Date(),
+      participants: [{
+        user: req.user.id,
+        joinedAt: new Date()
+      }],
+      status: 'missed' // Default status until someone joins
+    };
+    
+    chatRoom.callHistory.push(callHistory);
+    await chatRoom.save();
+    
+    // Create system message about call
+    await Message.create({
+      sender: req.user.id,
+      recipient: chatRoom.participants.find(id => id.toString() !== req.user.id),
+      chatRoom: chatRoom._id,
+      content: 'Audio call started',
+      messageType: 'call',
+      metadata: {
+        callId: chatRoom.callHistory[chatRoom.callHistory.length - 1]._id,
+        callType: 'audio'
+      }
+    });
+    
+    res.json({
+      callId: chatRoom.callHistory[chatRoom.callHistory.length - 1]._id,
+      startTime: callHistory.startTime,
+      initiator: req.user.id
+    });
+  } catch (error) {
+    console.error('Start audio call error:', error);
+    res.status(500).json({ error: 'Error starting audio call' });
+  }
+});
+
+app.post('/api/calls/:chatId/video', authenticateToken, async (req, res) => {
+  try {
+    const chatRoom = await ChatRoom.findById(req.params.chatId);
+    
+    if (!chatRoom) {
+      return res.status(404).json({ error: 'Chat room not found' });
+    }
+    
+    // Check if user is a participant
+    const isParticipant = chatRoom.participants.some(
+      participant => participant.toString() === req.user.id
+    );
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Not authorized to initiate call' });
+    }
+    
+    // Create call history entry
+    const callHistory = {
+      initiator: req.user.id,
+      callType: 'video',
+      startTime: new Date(),
+      participants: [{
+        user: req.user.id,
+        joinedAt: new Date()
+      }],
+      status: 'missed' // Default status until someone joins
+    };
+    
+    chatRoom.callHistory.push(callHistory);
+    await chatRoom.save();
+    
+    // Create system message about call
+    await Message.create({
+      sender: req.user.id,
+      recipient: chatRoom.participants.find(id => id.toString() !== req.user.id),
+      chatRoom: chatRoom._id,
+      content: 'Video call started',
+      messageType: 'call',
+      metadata: {
+        callId: chatRoom.callHistory[chatRoom.callHistory.length - 1]._id,
+        callType: 'video'
+      }
+    });
+    
+    res.json({
+      callId: chatRoom.callHistory[chatRoom.callHistory.length - 1]._id,
+      startTime: callHistory.startTime,
+      initiator: req.user.id
+    });
+  } catch (error) {
+    console.error('Start video call error:', error);
+    res.status(500).json({ error: 'Error starting video call' });
+  }
+});
+
+// Call management endpoints
+app.post('/api/calls/:callId/accept', authenticateToken, async (req, res) => {
+  try {
+    // Find chat room containing this call
+    const chatRoom = await ChatRoom.findOne({
+      'callHistory._id': req.params.callId
+    });
+    
+    if (!chatRoom) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Find the specific call in the history
+    const callIndex = chatRoom.callHistory.findIndex(
+      call => call._id.toString() === req.params.callId
+    );
+    
+    if (callIndex === -1) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Check if user is a participant in the chat
+    const isParticipant = chatRoom.participants.some(
+      participant => participant.toString() === req.user.id
+    );
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Not authorized to accept this call' });
+    }
+    
+    // Check if user is already in the call
+    const isInCall = chatRoom.callHistory[callIndex].participants.some(
+      participant => participant.user.toString() === req.user.id
+    );
+    
+    if (!isInCall) {
+      // Add user to call participants
+      chatRoom.callHistory[callIndex].participants.push({
+        user: req.user.id,
+        joinedAt: new Date()
+      });
+      
+      // Update call status
+      chatRoom.callHistory[callIndex].status = 'completed';
+    }
+    
+    await chatRoom.save();
+    
+    res.json({
+      success: true,
+      callId: req.params.callId,
+      acceptedBy: req.user.id
+    });
+  } catch (error) {
+    console.error('Accept call error:', error);
+    res.status(500).json({ error: 'Error accepting call' });
+  }
+});
+
+app.post('/api/calls/:callId/decline', authenticateToken, async (req, res) => {
+  try {
+    // Find chat room containing this call
+    const chatRoom = await ChatRoom.findOne({
+      'callHistory._id': req.params.callId
+    });
+    
+    if (!chatRoom) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Find the specific call in the history
+    const callIndex = chatRoom.callHistory.findIndex(
+      call => call._id.toString() === req.params.callId
+    );
+    
+    if (callIndex === -1) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Check if user is a participant in the chat
+    const isParticipant = chatRoom.participants.some(
+      participant => participant.toString() === req.user.id
+    );
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Not authorized to decline this call' });
+    }
+    
+    // Update call status
+    chatRoom.callHistory[callIndex].status = 'declined';
+    
+    await chatRoom.save();
+    
+    // Create system message about call decline
+    await Message.create({
+      sender: req.user.id,
+      recipient: chatRoom.participants.find(id => id.toString() !== req.user.id),
+      chatRoom: chatRoom._id,
+      content: 'Call declined',
+      messageType: 'call',
+      metadata: {
+        callId: req.params.callId,
+        callType: chatRoom.callHistory[callIndex].callType,
+        status: 'declined'
+      }
+    });
+    
+    res.json({
+      success: true,
+      callId: req.params.callId,
+      declinedBy: req.user.id
+    });
+  } catch (error) {
+    console.error('Decline call error:', error);
+    res.status(500).json({ error: 'Error declining call' });
+  }
+});
+
+app.post('/api/calls/:callId/end', authenticateToken, async (req, res) => {
+  try {
+    // Find chat room containing this call
+    const chatRoom = await ChatRoom.findOne({
+      'callHistory._id': req.params.callId
+    });
+    
+    if (!chatRoom) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Find the specific call in the history
+    const callIndex = chatRoom.callHistory.findIndex(
+      call => call._id.toString() === req.params.callId
+    );
+    
+    if (callIndex === -1) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    // Check if user is a participant in the call
+    const isInCall = chatRoom.callHistory[callIndex].participants.some(
+      participant => participant.user.toString() === req.user.id
+    );
+    
+    if (!isInCall) {
+      return res.status(403).json({ error: 'Not authorized to end this call' });
+    }
+    
+    // Set end time and calculate duration
+    const endTime = new Date();
+    const startTime = chatRoom.callHistory[callIndex].startTime;
+    const durationMs = endTime - startTime;
+    const durationSeconds = Math.floor(durationMs / 1000);
+    
+    // Update call record
+    chatRoom.callHistory[callIndex].endTime = endTime;
+    chatRoom.callHistory[callIndex].duration = durationSeconds;
+    
+    // Update user's left time
+    const participantIndex = chatRoom.callHistory[callIndex].participants.findIndex(
+      participant => participant.user.toString() === req.user.id
+    );
+    
+    if (participantIndex !== -1) {
+      chatRoom.callHistory[callIndex].participants[participantIndex].leftAt = endTime;
+    }
+    
+    // If all participants have left, mark call as ended
+    const allLeft = chatRoom.callHistory[callIndex].participants.every(
+      participant => participant.leftAt
+    );
+    
+    if (allLeft) {
+      chatRoom.callHistory[callIndex].status = 'completed';
+    }
+    
+    await chatRoom.save();
+    
+    // Create system message about call ending
+    await Message.create({
+      sender: req.user.id,
+      recipient: chatRoom.participants.find(id => id.toString() !== req.user.id),
+      chatRoom: chatRoom._id,
+      content: `Call ended (${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, '0')})`,
+      messageType: 'call',
+      metadata: {
+        callId: req.params.callId,
+        callType: chatRoom.callHistory[callIndex].callType,
+        status: 'ended',
+        duration: durationSeconds
+      }
+    });
+    
+    res.json({
+      success: true,
+      callId: req.params.callId,
+      endedBy: req.user.id,
+      duration: durationSeconds
+    });
+  } catch (error) {
+    console.error('End call error:', error);
+    res.status(500).json({ error: 'Error ending call' });
+  }
+});
 // ----------------------
 // STORY ROUTES
 // ----------------------
@@ -4713,7 +9103,399 @@ app.get('/api/discover', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error loading discover content' });
   }
 });
+// 1. Record a profile view
+app.post('/api/profile-views', authenticateToken, async (req, res) => {
+  try {
+    const { profileId } = req.body;
+    
+    // Add validation for profileId
+    if (!profileId) {
+      return res.status(400).json({ error: 'Profile ID is required' });
+    }
+    
+    // Check if profileId is a valid ObjectId
+    if (!mongoose.isValidObjectId(profileId)) {
+      return res.status(400).json({ error: 'Invalid profile ID format' });
+    }
+    
+    // Don't record views of your own profile
+    if (profileId === req.user.id) {
+      return res.status(400).json({ error: 'Cannot record views of your own profile' });
+    }
+    
+    // Get both users to check privacy settings
+    const [viewedUser, viewingUser] = await Promise.all([
+      User.findById(profileId),
+      User.findById(req.user.id)
+    ]);
+    
+    // Rest of the function remains the same...
+  } catch (error) {
+    console.error('Record profile view error:', error);
+    res.status(500).json({ error: 'Error recording profile view' });
+  }
+});
+// 2. Get users who viewed your profile
+app.get('/api/profile-views/viewers', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      limit = 10, 
+      page = 1, 
+      period = 'month' // day, week, month, year, all
+    } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Determine date range based on period
+    let dateFilter = {};
+    const now = new Date();
+    
+    if (period !== 'all') {
+      const startDate = new Date();
+      
+      switch(period) {
+        case 'day':
+          startDate.setDate(startDate.getDate() - 1);
+          break;
+        case 'week':
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(startDate.getMonth() - 1);
+          break;
+        case 'year':
+          startDate.setFullYear(startDate.getFullYear() - 1);
+          break;
+      }
+      
+      dateFilter = { viewedAt: { $gte: startDate, $lte: now } };
+    }
+    
+    // Get count of viewers grouped by viewerId and visibility
+    const viewerData = await ProfileView.aggregate([
+      { 
+        $match: { 
+          profileId: new mongoose.Types.ObjectId(req.user.id),
+          ...dateFilter
+        } 
+      },
+      {
+        $sort: { viewedAt: -1 }
+      },
+      {
+        $group: {
+          _id: "$viewerId",
+          visibility: { $first: "$visibility" },
+          lastViewed: { $max: "$viewedAt" },
+          viewCount: { $sum: 1 }
+        }
+      },
+      {
+        $sort: { lastViewed: -1 }
+      },
+      {
+        $skip: skip
+      },
+      {
+        $limit: parseInt(limit)
+      }
+    ]);
+    
+    // Get total count
+    const totalViewers = await ProfileView.aggregate([
+      { 
+        $match: { 
+          profileId: new mongoose.Types.ObjectId(req.user.id),
+          ...dateFilter
+        } 
+      },
+      {
+        $group: {
+          _id: "$viewerId"
+        }
+      },
+      {
+        $count: "total"
+      }
+    ]);
+    
+    const total = totalViewers.length > 0 ? totalViewers[0].total : 0;
+    
+    // Populate viewer information based on visibility level
+    const populatedViewers = await Promise.all(
+      viewerData.map(async (viewer) => {
+        if (viewer.visibility === 'anonymous') {
+          // For anonymous viewers, return generic info
+          return {
+            _id: null,
+            anonymous: true,
+            lastViewed: viewer.lastViewed,
+            viewCount: viewer.viewCount,
+            title: 'Someone',
+            description: 'This person is viewing profiles anonymously'
+          };
+        } else {
+          // For identifiable viewers, get user details
+          const viewerUser = await User.findById(viewer._id)
+            .select('firstName lastName profilePicture headline industry company location')
+            .lean();
+          
+          if (!viewerUser) {
+            return {
+              _id: null,
+              deleted: true,
+              lastViewed: viewer.lastViewed,
+              viewCount: viewer.viewCount,
+              title: 'Deleted User',
+              description: 'This user no longer exists'
+            };
+          }
+          
+          // For limited visibility, mask details
+          if (viewer.visibility === 'limited') {
+            return {
+              _id: null,
+              limited: true,
+              lastViewed: viewer.lastViewed,
+              viewCount: viewer.viewCount,
+              title: viewerUser.industry || 'Professional',
+              description: `${viewerUser.company?.name || 'A company'} • ${viewerUser.location?.address || 'Unknown location'}`
+            };
+          }
+          
+          // Full visibility
+          return {
+            ...viewerUser,
+            lastViewed: viewer.lastViewed,
+            viewCount: viewer.viewCount
+          };
+        }
+      })
+    );
+    
+    res.json({
+      viewers: populatedViewers,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get profile viewers error:', error);
+    res.status(500).json({ error: 'Error fetching profile viewers' });
+  }
+});
 
+// 3. Get profile view analytics 
+app.get('/api/profile-views/analytics', authenticateToken, async (req, res) => {
+  try {
+    const { period = 'month' } = req.query; // day, week, month, year
+    
+    // Get the user's analytics data
+    const user = await User.findById(req.user.id)
+      .select('analytics.profileViews')
+      .lean();
+    
+    if (!user || !user.analytics || !user.analytics.profileViews) {
+      return res.json({
+        totalViews: 0,
+        viewsHistory: [],
+        percentChange: 0
+      });
+    }
+    
+    // Determine date ranges for current and previous periods
+    const now = new Date();
+    let startDate, prevStartDate, prevEndDate;
+    
+    switch(period) {
+      case 'day':
+        startDate = new Date(now);
+        startDate.setHours(0, 0, 0, 0);
+        
+        prevStartDate = new Date(startDate);
+        prevStartDate.setDate(prevStartDate.getDate() - 1);
+        prevEndDate = new Date(startDate);
+        break;
+      
+      case 'week':
+        startDate = new Date(now);
+        startDate.setDate(startDate.getDate() - 7);
+        
+        prevStartDate = new Date(startDate);
+        prevStartDate.setDate(prevStartDate.getDate() - 7);
+        prevEndDate = new Date(startDate);
+        break;
+      
+      case 'month':
+        startDate = new Date(now);
+        startDate.setMonth(startDate.getMonth() - 1);
+        
+        prevStartDate = new Date(startDate);
+        prevStartDate.setMonth(prevStartDate.getMonth() - 1);
+        prevEndDate = new Date(startDate);
+        break;
+      
+      case 'year':
+        startDate = new Date(now);
+        startDate.setFullYear(startDate.getFullYear() - 1);
+        
+        prevStartDate = new Date(startDate);
+        prevStartDate.setFullYear(prevStartDate.getFullYear() - 1);
+        prevEndDate = new Date(startDate);
+        break;
+    }
+    
+    // Filter view history for current period
+    const viewsHistory = user.analytics.profileViews.history
+      .filter(entry => new Date(entry.date) >= startDate && new Date(entry.date) <= now)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    // Calculate total views for current period
+    const totalViews = viewsHistory.reduce((sum, entry) => sum + entry.count, 0);
+    
+    // Calculate total views for previous period for comparison
+    const prevViewsHistory = user.analytics.profileViews.history
+      .filter(entry => new Date(entry.date) >= prevStartDate && new Date(entry.date) < prevEndDate);
+    
+    const prevTotalViews = prevViewsHistory.reduce((sum, entry) => sum + entry.count, 0);
+    
+    // Calculate percent change
+    let percentChange = 0;
+    if (prevTotalViews > 0) {
+      percentChange = Math.round(((totalViews - prevTotalViews) / prevTotalViews) * 100);
+    } else if (totalViews > 0) {
+      percentChange = 100; // If previous period had 0 views and current has some
+    }
+    
+    // Get top industries of viewers
+    // This requires a more complex query to the ProfileView collection
+    const topIndustries = await ProfileView.aggregate([
+      {
+        $match: {
+          profileId: new mongoose.Types.ObjectId(req.user.id),
+          viewedAt: { $gte: startDate, $lte: now },
+          visibility: { $ne: 'anonymous' }
+        }
+      },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'viewerId',
+          foreignField: '_id',
+          as: 'viewer'
+        }
+      },
+      { $unwind: '$viewer' },
+      {
+        $group: {
+          _id: '$viewer.industry',
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { count: -1 } },
+      { $limit: 5 }
+    ]);
+    
+    res.json({
+      totalViews,
+      viewsHistory,
+      percentChange,
+      previousPeriodViews: prevTotalViews,
+      topIndustries: topIndustries.map(item => ({
+        industry: item._id || 'Unknown',
+        count: item.count
+      }))
+    });
+  } catch (error) {
+    console.error('Get profile view analytics error:', error);
+    res.status(500).json({ error: 'Error fetching profile view analytics' });
+  }
+});
+
+// 4. Update profile view privacy settings
+app.put('/api/settings/profile-view-privacy', authenticateToken, async (req, res) => {
+  try {
+    const { visibility } = req.body;
+    
+    if (!['full', 'limited', 'anonymous'].includes(visibility)) {
+      return res.status(400).json({ error: 'Invalid visibility option' });
+    }
+    
+    // Update user's privacy settings
+    await User.findByIdAndUpdate(req.user.id, {
+      'privacy.profileViewSettings': visibility
+    });
+    
+    res.json({
+      success: true,
+      message: 'Profile view privacy settings updated',
+      visibility
+    });
+  } catch (error) {
+    console.error('Update profile view privacy settings error:', error);
+    res.status(500).json({ error: 'Error updating profile view privacy settings' });
+  }
+});
+
+// 5. Get your recent profile view activity (who you viewed)
+app.get('/api/profile-views/activity', authenticateToken, async (req, res) => {
+  try {
+    const { limit = 10, page = 1 } = req.query;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Get profiles you viewed
+    const viewedProfiles = await ProfileView.find({
+      viewerId: req.user.id
+    })
+    .sort('-viewedAt')
+    .skip(skip)
+    .limit(parseInt(limit));
+    
+    // Get total count
+    const total = await ProfileView.countDocuments({ viewerId: req.user.id });
+    
+    // Populate profile information
+    const populatedViews = await Promise.all(
+      viewedProfiles.map(async (view) => {
+        const profile = await User.findById(view.profileId)
+          .select('firstName lastName profilePicture headline industry company location')
+          .lean();
+          
+        if (!profile) {
+          return {
+            _id: view.profileId,
+            deleted: true,
+            viewedAt: view.viewedAt,
+            title: 'Deleted User',
+            description: 'This user no longer exists'
+          };
+        }
+        
+        return {
+          ...profile,
+          viewedAt: view.viewedAt
+        };
+      })
+    );
+    
+    res.json({
+      viewedProfiles: populatedViews,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get profile view activity error:', error);
+    res.status(500).json({ error: 'Error fetching profile view activity' });
+  }
+});
 // ----------------------
 // PORTFOLIO SYSTEM ROUTES
 // ----------------------
@@ -4721,46 +9503,56 @@ app.get('/api/discover', authenticateToken, async (req, res) => {
 // Project Routes
 app.post('/api/projects', authenticateToken, upload.array('attachments', 5), async (req, res) => {
   try {
-    const {
-      title, description, category, tags, status,
-      startDate, endDate, collaborators, links,
-      milestones, visibility
-    } = req.body;
+    console.log('==== PROJECT CREATION REQUEST ====');
+    console.log('Request body:', req.body);
+    console.log('Files received:', req.files?.length || 0);
     
-    let processedCollaborators = [];
-    if (collaborators) {
+    // Check for projectData (from the emergency fix)
+    let title, description, category, tags, status, startDate, endDate, 
+        collaborators, links, milestones, visibility;
+    
+    if (req.body.projectData) {
+      // Parse the stringified JSON data
       try {
-        processedCollaborators = typeof collaborators === 'string' 
-          ? JSON.parse(collaborators) 
-          : collaborators;
+        const projectData = JSON.parse(req.body.projectData);
+        
+        // Extract fields from the parsed JSON
+        ({ 
+          title, description, category, tags, status,
+          startDate, endDate, collaborators, links,
+          milestones, visibility 
+        } = projectData);
+        
+        console.log('Extracted title from projectData:', title);
       } catch (e) {
-        console.error('Error parsing collaborators:', e);
-        processedCollaborators = [];
+        console.error('Error parsing projectData:', e);
       }
+    } else {
+      // Use regular fields
+      ({ 
+        title, description, category, tags, status,
+        startDate, endDate, collaborators, links,
+        milestones, visibility 
+      } = req.body);
     }
     
-    let processedLinks = [];
-    if (links) {
-      try {
-        processedLinks = typeof links === 'string' 
-          ? JSON.parse(links) 
-          : links;
-      } catch (e) {
-        console.error('Error parsing links:', e);
-        processedLinks = [];
-      }
+    // Also check if title was sent separately
+    if (!title && req.body.title) {
+      title = req.body.title;
+      console.log('Using title from direct form field:', title);
     }
     
-    let processedMilestones = [];
-    if (milestones) {
-      try {
-        processedMilestones = typeof milestones === 'string' 
-          ? JSON.parse(milestones) 
-          : milestones;
-      } catch (e) {
-        console.error('Error parsing milestones:', e);
-        processedMilestones = [];
-      }
+    // If still no title, return error
+    if (!title || title.trim() === '') {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        errors: { title: 'Title is required' },
+        debug: {
+          bodyKeys: Object.keys(req.body),
+          hasProjectData: !!req.body.projectData,
+          bodyTitleType: typeof req.body.title
+        }
+      });
     }
     
     // Process uploaded files
@@ -4770,49 +9562,62 @@ app.post('/api/projects', authenticateToken, upload.array('attachments', 5), asy
       fileType: file.mimetype
     })) : [];
     
-    const project = await Project.create({
+    // Now create the project
+    const projectData = {
       user: req.user.id,
-      title,
-      description,
-      category,
+      title: title.trim(),
+      description: description || '',
+      category: category || 'other',
       tags: tags ? (typeof tags === 'string' ? tags.split(',') : tags) : [],
-      status,
+      status: status || 'in-progress',
       startDate: startDate ? new Date(startDate) : new Date(),
       endDate: endDate ? new Date(endDate) : null,
-      collaborators: processedCollaborators,
       attachments,
-      links: processedLinks,
-      milestones: processedMilestones,
-      visibility
-    });
+      visibility: visibility || 'public'
+    };
     
-    // Notify collaborators
-    if (processedCollaborators && processedCollaborators.length > 0) {
-      for (const collab of processedCollaborators) {
-        createNotification({
-          recipient: collab.user,
-          sender: req.user.id,
-          type: 'project_collaboration',
-          contentType: 'project',
-          contentId: project._id,
-          text: `${req.user.firstName} ${req.user.lastName} added you as a collaborator on project: ${title}`,
-          actionUrl: `/projects/${project._id}`
-        });
-      }
+    // Add optional fields if they exist
+    if (collaborators) {
+      projectData.collaborators = typeof collaborators === 'string' 
+        ? JSON.parse(collaborators) 
+        : collaborators;
     }
     
-    const populatedProject = await Project.findById(project._id)
-      .populate('user', 'firstName lastName profilePicture')
-      .populate('collaborators.user', 'firstName lastName profilePicture')
-      .populate('likes', 'firstName lastName profilePicture');
+    if (links) {
+      projectData.links = typeof links === 'string' 
+        ? JSON.parse(links) 
+        : links;
+    }
     
-    res.status(201).json(populatedProject);
+    if (milestones) {
+      projectData.milestones = typeof milestones === 'string' 
+        ? JSON.parse(milestones) 
+        : milestones;
+    }
+    
+    console.log('Final project data:', JSON.stringify(projectData, null, 2));
+    
+    // Create the project
+    const project = await Project.create(projectData);
+    
+    // Return the created project
+    res.status(201).json(project);
   } catch (error) {
     console.error('Create project error:', error);
-    res.status(500).json({ error: 'Error creating project' });
+    
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        errors: error.errors 
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Error creating project', 
+      message: error.message 
+    });
   }
 });
-
 // Streak Routes
 app.post('/api/streaks', authenticateToken, async (req, res) => {
   try {
@@ -5029,6 +9834,153 @@ io.use((socket, next) => {
       }
       // Near the top of your file where Cloudinary is set up
 console.log('Cloudinary config status:', !!cloudinary.config().cloud_name);
+io.on('connection', (socket) => {
+  console.log('New client connected:', socket.id);
+  
+  // Authenticate socket connection
+  socket.on('authenticate', async (data) => {
+    try {
+      const { token } = data;
+      
+      if (!token) {
+        socket.emit('auth_error', { message: 'No token provided' });
+        return;
+      }
+      
+      // Verify token
+      const decoded = jwt.verify(token, JWT_SECRET);
+      socket.userId = decoded.id;
+      
+      // Join user-specific room
+      socket.join(`user_${decoded.id}`);
+      
+      // Update user online status
+      await User.findByIdAndUpdate(decoded.id, {
+        online: true,
+        lastActive: new Date()
+      });
+      
+      // Get user's chats and join those rooms
+      const chats = await ChatRoom.find({
+        participants: decoded.id
+      });
+      
+      chats.forEach(chat => {
+        socket.join(`chat_${chat._id}`);
+      });
+      
+      // Get user's groups and join those rooms
+      const groups = await Group.find({
+        'members.user': decoded.id
+      });
+      
+      groups.forEach(group => {
+        socket.join(`group_${group._id}`);
+      });
+      
+      socket.emit('authenticated', { userId: decoded.id });
+      
+      // Notify connections that user is online
+      const user = await User.findById(decoded.id);
+      if (user && user.connections) {
+        io.to(user.connections.map(id => `user_${id}`)).emit('user_online', {
+          userId: decoded.id,
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Socket authentication error:', error);
+      socket.emit('auth_error', { message: 'Authentication failed' });
+    }
+  });
+  
+  // Handle disconnect
+  socket.on('disconnect', async () => {
+    console.log('Client disconnected:', socket.id);
+    
+    if (socket.userId) {
+      // Update user offline status
+      await User.findByIdAndUpdate(socket.userId, {
+        online: false,
+        lastActive: new Date()
+      });
+      
+      // Notify connections that user is offline
+      const user = await User.findById(socket.userId);
+      if (user && user.connections) {
+        io.to(user.connections.map(id => `user_${id}`)).emit('user_offline', {
+          userId: socket.userId,
+          timestamp: new Date()
+        });
+      }
+    }
+  });
+  
+  // Handle typing indicators
+  socket.on('typing', (data) => {
+    const { chatId, isTyping } = data;
+    
+    if (!socket.userId || !chatId) return;
+    
+    socket.to(`chat_${chatId}`).emit('typing_indicator', {
+      chatId,
+      userId: socket.userId,
+      isTyping
+    });
+  });
+  
+  // Handle location sharing
+  socket.on('share_location', async (data) => {
+    const { coordinates, accuracy } = data;
+    
+    if (!socket.userId || !coordinates) return;
+    
+    try {
+      const user = await User.findById(socket.userId);
+      
+      // Check if location sharing is enabled
+      if (!user.locationSharing || !user.locationSharing.enabled) {
+        socket.emit('location_error', { 
+          message: 'Location sharing is not enabled' 
+        });
+        return;
+      }
+      
+      // Update user location
+      await User.findByIdAndUpdate(socket.userId, {
+        $set: {
+          'location.coordinates': coordinates,
+          'location.accuracy': accuracy,
+          'location.lastUpdated': new Date()
+        }
+      });
+      
+      // Determine recipients
+      let recipients = [];
+      
+      if (user.locationSharing.visibleTo === 'connections') {
+        recipients = user.connections || [];
+      } else if (user.locationSharing.visibleTo === 'selected') {
+        recipients = user.locationSharing.selectedUsers || [];
+      }
+      
+      // Emit location update to recipients
+      io.to(recipients.map(id => `user_${id}`)).emit('location_update', {
+        userId: socket.userId,
+        coordinates,
+        accuracy,
+        timestamp: new Date()
+      });
+      
+      socket.emit('location_shared', { success: true });
+    } catch (error) {
+      console.error('Location sharing error:', error);
+      socket.emit('location_error', { 
+        message: 'Error sharing location' 
+      });
+    }
+  });
+});
 
     });
   
@@ -5051,4 +10003,5 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong!' });
 });
 })
+
 module.exports = app;
