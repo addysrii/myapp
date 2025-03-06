@@ -31,24 +31,9 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE_URL = `https://myapp-uc9m.onrender.com`;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 app.use(cors({
-  origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if(!origin) return callback(null, true);
-    
-    // Define allowed origins
-    const allowedOrigins = [
-      'http://localhost:5173',
-      'https://appy-coral.vercel.app'
-    ];
-    
-    if(allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: 'http://localhost:5173', // Your frontend URL
   credentials: true
 }));
 // Environment variables
@@ -90,10 +75,10 @@ app.use(session({
 
 app.use(passport.initialize());
 app.use(passport.session());
-// app.use(cors({
-//   origin: 'http://localhost:5173', // Your frontend URL
-//   credentials: true
-// }));
+app.use(cors({
+  origin: 'http://localhost:5173', // Your frontend URL
+  credentials: true
+}));
 app.use(bodyParser.json());
 
 // Cloudinary storage setup for file uploads
@@ -10393,7 +10378,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/professio
 const io = new Server(server, {
   cors: {
     origin: [
-      'https://appy-coral.vercel.app/',   // Development frontend URL
+      'http://localhost:5173',   // Development frontend URL
       'http://localhost:3000',   // If your backend is also serving frontend
       /\.yourdomain\.com$/       // Production domain pattern
     ],
@@ -10603,8 +10588,46 @@ io.on('connection', (socket) => {
 
    //Continuing with WebSocket connection handling from part 4
 
-// WebSocket heartbeat
+// WebSocVket heartbeat
+app.post('/api/location/continuous-update', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { latitude, longitude, accuracy, heading, speed } = req.body;
 
+    // Validate input
+    if (!latitude || !longitude) {
+      return res.status(400).json({ msg: 'Latitude and longitude are required' });
+    }
+
+    // Update user location
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        'location.coordinates': [longitude, latitude], // GeoJSON format: [lng, lat]
+        'location.accuracy': accuracy || null,
+        'location.heading': heading || null,
+        'location.speed': speed || null,
+        'location.lastUpdated': new Date()
+      },
+      { new: true }
+    );
+
+    // Get the location tracker instance
+    const locationTracker = req.app.get('locationTracker');
+    if (locationTracker && !locationTracker.trackingIntervals.has(userId)) {
+      // Start tracking if not already tracking
+      locationTracker.startTracking(userId);
+    }
+
+    res.json({ 
+      msg: 'Location updated successfully',
+      location: updatedUser.location
+    });
+  } catch (error) {
+    console.error('Error updating location:', error);
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
 
 
 // Error handling middleware
