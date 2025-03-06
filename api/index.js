@@ -6355,7 +6355,55 @@ app.get('/api/map/jobs', authenticateToken, async (req, res) => {
 // ----------------------
 // REAL-TIME LOCATION SHARING AND TRACKING
 // ----------------------
+const updateUserLocation = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { latitude, longitude, accuracy, heading, speed } = req.body;
 
+    // Validate input
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+
+    // Log what we're attempting to save
+    console.log(`Updating location for user ${userId}: [${longitude}, ${latitude}]`);
+
+    // Update user location with proper MongoDB structure
+    // Note: MongoDB GeoJSON uses [longitude, latitude] format not [latitude, longitude]
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          'location.type': 'Point',
+          'location.coordinates': [parseFloat(longitude), parseFloat(latitude)],
+          'location.accuracy': accuracy ? parseFloat(accuracy) : null,
+          'location.heading': heading ? parseFloat(heading) : null,
+          'location.speed': speed ? parseFloat(speed) : null,
+          'location.lastUpdated': new Date()
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      console.log(`User ${userId} not found`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Log successful update
+    console.log(`Successfully updated location for user ${userId}`);
+    console.log('Updated location:', updatedUser.location);
+
+    res.json({ 
+      success: true,
+      message: 'Location updated successfully',
+      location: updatedUser.location
+    });
+  } catch (error) {
+    console.error('Error updating location:', error);
+    res.status(500).json({ error: 'Server error updating location' });
+  }
+};
 // Enable/disable real-time location sharing
 app.post('/api/location/continuous-update', authenticateToken, async (req, res) => {
   try {
