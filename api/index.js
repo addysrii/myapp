@@ -6357,6 +6357,43 @@ app.get('/api/map/jobs', authenticateToken, async (req, res) => {
 // ----------------------
 
 // Enable/disable real-time location sharing
+app.post('/api/location/continuous-update', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { latitude, longitude, accuracy, heading, speed } = req.body;
+
+    // Validate input
+    if (!latitude || !longitude) {
+      return res.status(400).json({ msg: 'Latitude and longitude are required' });
+    }
+
+    // Update user location
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        'location.coordinates': [longitude, latitude], // GeoJSON format: [lng, lat]
+        'location.accuracy': accuracy || null,
+        'location.heading': heading || null,
+        'location.speed': speed || null,
+        'location.lastUpdated': new Date(),
+        'location.type': 'Point' // Ensure GeoJSON type is set
+      },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ msg: 'User not found' });
+    }
+
+    res.json({ 
+      msg: 'Location updated successfully',
+      location: updatedUser.location
+    });
+  } catch (error) {
+    console.error('Error updating location:', error);
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
 app.post('/api/location/sharing', authenticateToken, async (req, res) => {
   try {
     const { enabled, duration, visibleTo } = req.body;
