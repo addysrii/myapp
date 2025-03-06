@@ -779,19 +779,34 @@ const userSchema = new mongoose.Schema({
   profilePicture: String,
   headline: String,
   industry: String,
-  location: {
+    location: {
     type: {
       type: String,
       enum: ['Point'],
       default: 'Point'
     },
     coordinates: {
-      type: [Number],
-      required: true,
+      type: [Number], // [longitude, latitude] format for MongoDB
       default: [0, 0]
     },
     address: String,
     lastUpdated: Date
+  },
+    locationSharing: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    expiresAt: Date,
+    visibleTo: {
+      type: String,
+      enum: ['connections', 'everyone', 'selected'],
+      default: 'connections'
+    },
+    selectedUsers: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }]
   },
   connections: [{
     type: mongoose.Schema.Types.ObjectId,
