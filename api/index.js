@@ -3185,111 +3185,95 @@ app.put('/api/location', authenticateToken, async (req, res) => {
 // Add this to your server.js file, with your other API routes
 // This is the corrected server-side implementation for the /api/network/nearby endpoint
 
+// Replace this endpoint in your server.js file
+
 app.get('/api/network/nearby', authenticateToken, async (req, res) => {
   try {
-    // Extract parameters from request
-    const { distance = 10, latitude, longitude, industries, skills, availableForMeeting } = req.query;
+    const { distance = 10 } = req.query;
+    const currentUser = await User.findById(req.user.id);
     
-    // Validate required parameters
-    if (!latitude || !longitude) {
-      return res.status(400).json({ error: 'Location coordinates required' });
+    // Check if user has location data
+    if (!currentUser || !currentUser.location || !currentUser.location.coordinates) {
+      console.log('User has no location data');
+      return res.status(400).json({ error: 'User location not available' });
     }
     
-    // Ensure the values are numbers
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
-    const distanceKm = parseInt(distance);
+    // Get coordinates from user's saved location
+    const [longitude, latitude] = currentUser.location.coordinates;
     
-    if (isNaN(lat) || isNaN(lng) || isNaN(distanceKm)) {
-      return res.status(400).json({ error: 'Invalid location or distance values' });
-    }
+    console.log(`Searching for users near [${latitude}, ${longitude}] within ${distance}km`);
     
-    // Log the search parameters
-    console.log(`Searching for users near [${lat}, ${lng}] within ${distanceKm}km`);
-    
-    // Build MongoDB query for geospatial search
-    let query = {
+    // Find users within the specified distance
+    // Make sure we properly handle potential missing location data
+    const nearbyUsers = await User.find({
       _id: { $ne: req.user.id }, // Exclude current user
-      'location.coordinates': {
+      "location.coordinates": {
         $near: {
           $geometry: {
             type: 'Point',
-            coordinates: [lng, lat] // MongoDB uses [longitude, latitude] order
+            coordinates: [longitude, latitude]
           },
-          $maxDistance: distanceKm * 1000 // Convert km to meters
+          $maxDistance: parseInt(distance) * 1000 // Convert km to meters
         }
       }
-    };
+    })
+    .select('firstName lastName profilePicture headline industry location')
+    .limit(50);
     
-    // Add optional filters
-    if (industries) {
-      query.industry = industries;
-    }
+    console.log(`Found ${nearbyUsers.length} users nearby`);
     
-    if (skills) {
-      // If skills is a comma-separated string, split it
-      const skillsArray = typeof skills === 'string' ? skills.split(',') : [skills];
-      query['skills.name'] = { $in: skillsArray };
-    }
-    
-    if (availableForMeeting === 'true') {
-      query.availableForMeeting = true;
-    }
-    
-    // Execute the geospatial query
-    const nearbyUsers = await User.find(query)
-      .select('firstName lastName profilePicture headline industry location')
-      .limit(50);
-    
-    console.log(`Found ${nearbyUsers.length} nearby users`);
-    
-    // Calculate accurate distance for each user and add to response
+    // Add distance calculation - safely handle missing coordinates
     const results = nearbyUsers.map(user => {
-      // Calculate distance using Haversine formula
-      const userCoords = user.location.coordinates;
-      const distance = getDistanceFromLatLonInKm(
-        lat,
-        lng,
-        userCoords[1], // Latitude (second element in GeoJSON)
-        userCoords[0]  // Longitude (first element in GeoJSON)
-      );
+      // Default distance if calculation fails
+      let calculatedDistance = null;
+      
+      // Only calculate if both user locations have valid coordinates
+      if (user.location && 
+          user.location.coordinates && 
+          user.location.coordinates.length === 2) {
+        
+        calculatedDistance = getDistanceFromLatLonInKm(
+          latitude,
+          longitude,
+          user.location.coordinates[1],  // latitude
+          user.location.coordinates[0]   // longitude
+        );
+      }
       
       return {
         ...user.toObject(),
-        distance: parseFloat(distance.toFixed(1)) // Round to 1 decimal place
+        distance: calculatedDistance !== null ? parseFloat(calculatedDistance.toFixed(1)) : null
       };
     });
-    
-    // Sort results by distance (closest first)
-    results.sort((a, b) => a.distance - b.distance);
     
     res.json(results);
   } catch (error) {
     console.error('Get nearby professionals error:', error);
-    
-    // Check if it's a MongoDB geospatial index error
-    if (error.name === 'MongoError' && error.code === 16755) {
-      return res.status(500).json({ 
-        error: 'Geospatial index error. Make sure users have valid location coordinates.'
-      });
-    }
-    
     res.status(500).json({ error: 'Error fetching nearby professionals' });
   }
 });
 
-// Helper function to calculate distance between two points on Earth
+// Helper function to calculate distance
 function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radius of the earth in km
-  const dLat = deg2rad(lat2 - lat1);
-  const dLon = deg2rad(lon2 - lon1);
-  const a = 
-    Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
-    Math.sin(dLon/2) * Math.sin(dLon/2); 
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
-  const d = R * c; // Distance in km
-  return d;
+  if (lat1 === undefined || lon1 === undefined || lat2 === undefined || lon2 === undefined) {
+    return null;
+  }
+  
+  try {
+    const R = 6371; // Radius of the earth in km
+    const dLat = deg2rad(lat2 - lat1);
+    const dLon = deg2rad(lon2 - lon1);
+    const a = 
+      Math.sin(dLat/2) * Math.sin(dLat/2) +
+      Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
+      Math.sin(dLon/2) * Math.sin(dLon/2); 
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+    const d = R * c; // Distance in km
+    return d;
+  } catch (error) {
+    console.error('Error calculating distance:', error);
+    return null;
+  }
 }
 
 function deg2rad(deg) {
