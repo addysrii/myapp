@@ -80,10 +80,7 @@ app.use(session({
 
 app.use(passport.initialize());
 app.use(passport.session());
-app.use(cors({
-  origin: 'https://appy-coral.vercel.app/', // Your frontend URL
-  credentials: true
-}));
+
 app.use(bodyParser.json());
 
 // Cloudinary storage setup for file uploads
