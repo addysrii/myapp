@@ -33,7 +33,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const BASE_URL =  `https://myapp-uc9m.onrender.com`;
 app.use(cors({
-  origin: 'https://appy-coral.vercel.app', // Your frontend URL
+app.use(cors({
+  origin: [
+    'https://appy-coral.vercel.app',
+    'https://appy-coral.vercel.app/', // Include both versions to be safe
+    'http://localhost:3000'  // For local development
+  ],
   credentials: true
 }));
 // Environment variables
