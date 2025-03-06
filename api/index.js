@@ -3246,7 +3246,20 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
       };
     });
     
-    res.json(results);
+    // Sort results by distance (closest first)
+    const sortedResults = results.sort((a, b) => {
+      // Handle null distances (move them to the end)
+      if (a.distance === null) return 1;
+      if (b.distance === null) return -1;
+      
+      // Sort by ascending distance (closest first)
+      return a.distance - b.distance;
+    });
+    
+    console.log('Sorted users by distance:', 
+      sortedResults.map(u => `${u.firstName} ${u.lastName} - ${u.distance}km`).join(', '));
+    
+    res.json(sortedResults);
   } catch (error) {
     console.error('Get nearby professionals error:', error);
     res.status(500).json({ error: 'Error fetching nearby professionals' });
@@ -3278,7 +3291,7 @@ function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
 
 function deg2rad(deg) {
   return deg * (Math.PI/180);
-}
+},
 // Privacy settings update
 app.put('/api/privacy-settings', authenticateToken, async (req, res) => {
   try {
