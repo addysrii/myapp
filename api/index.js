@@ -31,7 +31,7 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const BASE_URL =  `https://myapp-uc9m.onrender.com`;
 app.use(cors({
   origin: 'http://localhost:5173', // Your frontend URL
   credentials: true
@@ -76,7 +76,7 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 app.use(cors({
-  origin: 'http://localhost:5173', // Your frontend URL
+  origin: 'https://appy-coral.vercel.app/', // Your frontend URL
   credentials: true
 }));
 app.use(bodyParser.json());
