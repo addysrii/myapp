@@ -32,7 +32,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const BASE_URL =  `https://myapp-uc9m.onrender.com`;
-app.use(cors({
+
 app.use(cors({
   origin: [
     'https://appy-coral.vercel.app',
