@@ -35,8 +35,8 @@ const BASE_URL =  `https://myapp-uc9m.onrender.com`;
 
 app.use(cors({
   origin: [
-    'https://appy-coral.vercel.app',
-    'https://appy-coral.vercel.app/', // Include both versions to be safe
+    'https://meetkats.com',
+    'https://meetkats.com/', // Include both versions to be safe
     'http://localhost:3000'  // For local development
   ],
   credentials: true
