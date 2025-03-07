@@ -31,7 +31,7 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE_URL =  `https://myapp-uc9m.onrender.com`;
+const BASE_URL =  `https://myapp-nt8s.onrender.com`;
 
 app.use(cors({
   origin: [
