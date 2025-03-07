@@ -3201,10 +3201,15 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
     // Get coordinates from user's saved location
     const [longitude, latitude] = currentUser.location.coordinates;
     
+    // Add validation for coordinates
+    if (!validateCoordinates(latitude, longitude)) {
+      console.log('Invalid user coordinates:', latitude, longitude);
+      return res.status(400).json({ error: 'Invalid user location coordinates' });
+    }
+    
     console.log(`Searching for users near [${latitude}, ${longitude}] within ${distance}km`);
     
     // Find users within the specified distance
-    // Make sure we properly handle potential missing location data
     const nearbyUsers = await User.find({
       _id: { $ne: req.user.id }, // Exclude current user
       "location.coordinates": {
@@ -3222,7 +3227,7 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
     
     console.log(`Found ${nearbyUsers.length} users nearby`);
     
-    // Add distance calculation - safely handle missing coordinates
+    // Add distance calculation with proper coordinate handling
     const results = nearbyUsers.map(user => {
       // Default distance if calculation fails
       let calculatedDistance = null;
@@ -3230,13 +3235,16 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
       // Only calculate if both user locations have valid coordinates
       if (user.location && 
           user.location.coordinates && 
-          user.location.coordinates.length === 2) {
+          user.location.coordinates.length === 2 &&
+          validateCoordinates(user.location.coordinates[1], user.location.coordinates[0])) {
         
+        // Note the correct order of coordinates:
+        // getDistanceFromLatLonInKm expects (lat1, lon1, lat2, lon2)
         calculatedDistance = getDistanceFromLatLonInKm(
-          latitude,
-          longitude,
-          user.location.coordinates[1],  // latitude
-          user.location.coordinates[0]   // longitude
+          latitude,                    // current user latitude
+          longitude,                   // current user longitude
+          user.location.coordinates[1], // other user latitude
+          user.location.coordinates[0]  // other user longitude
         );
       }
       
@@ -3257,7 +3265,8 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
     });
     
     console.log('Sorted users by distance:', 
-      sortedResults.map(u => `${u.firstName} ${u.lastName} - ${u.distance}km`).join(', '));
+      sortedResults.slice(0, 5).map(u => `${u.firstName} ${u.lastName} - ${u.distance}km`).join(', ') + 
+      (sortedResults.length > 5 ? '...' : ''));
     
     res.json(sortedResults);
   } catch (error) {
@@ -3268,7 +3277,8 @@ app.get('/api/network/nearby', authenticateToken, async (req, res) => {
 
 // Helper function to calculate distance
 function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
-  if (lat1 === undefined || lon1 === undefined || lat2 === undefined || lon2 === undefined) {
+  // Validate all inputs
+  if (!validateCoordinates(lat1, lon1) || !validateCoordinates(lat2, lon2)) {
     return null;
   }
   
@@ -3289,8 +3299,19 @@ function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
   }
 }
 
+// Helper function to convert degrees to radians
 function deg2rad(deg) {
   return deg * (Math.PI/180);
+}
+
+// Helper function to validate coordinates
+function validateCoordinates(lat, lon) {
+  return (
+    typeof lat === 'number' && !isNaN(lat) &&
+    typeof lon === 'number' && !isNaN(lon) &&
+    lat >= -90 && lat <= 90 &&
+    lon >= -180 && lon <= 180
+  );
 }
 // Privacy settings update
 app.put('/api/privacy-settings', authenticateToken, async (req, res) => {
