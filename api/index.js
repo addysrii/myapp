@@ -10538,9 +10538,9 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/professio
 const io = new Server(server, {
   cors: {
     origin: [
-      'https://appy-coral.vercel.app',   // Development frontend URL
-      'http://localhost:3000',   // If your backend is also serving frontend
-      /\.yourdomain\.com$/       // Production domain pattern
+      'https://meetkats.com',
+      'https://meetkats.com/',
+      'http://localhost:3000'
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -10674,7 +10674,45 @@ io.on('connection', (socket) => {
       }
     }
   });
+  // Add this to your io.on('connection') handler in server.js
+socket.on('call_started', async (data) => {
+  const { chatId, callId, type, initiator } = data;
   
+  // Notify other users in the chat
+  socket.to(`chat_${chatId}`).emit('incoming_call', {
+    chatId,
+    callId,
+    type,
+    from: initiator
+  });
+});
+
+socket.on('call_ice_candidate', (data) => {
+  const { callId, candidate, targetUserId } = data;
+  io.to(`user_${targetUserId}`).emit('call_ice_candidate', {
+    callId,
+    candidate,
+    from: socket.userId
+  });
+});
+
+socket.on('call_sdp_offer', (data) => {
+  const { callId, sdp, targetUserId } = data;
+  io.to(`user_${targetUserId}`).emit('call_sdp_offer', {
+    callId,
+    sdp,
+    from: socket.userId
+  });
+});
+
+socket.on('call_sdp_answer', (data) => {
+  const { callId, sdp, targetUserId } = data;
+  io.to(`user_${targetUserId}`).emit('call_sdp_answer', {
+    callId,
+    sdp,
+    from: socket.userId
+  });
+});
   // Handle typing indicators
   socket.on('typing', (data) => {
     const { chatId, isTyping } = data;
