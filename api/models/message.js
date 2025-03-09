@@ -16,7 +16,6 @@ const messageSchema = new mongoose.Schema({
   },
   content: {
     type: String,
-    required: true
   },
   read: {
     type: Boolean,
@@ -24,7 +23,13 @@ const messageSchema = new mongoose.Schema({
   },
   createdAt: {
     type: Date,
-    default: Date.now
+    default: Date.now,
+    validate: {
+      validator: function(v) {
+        return !isNaN(new Date(v).getTime());
+      },
+      message: props => `${props.value} is not a valid date!`
+    }
   },
   messageType: {
     type: String,
@@ -56,4 +61,4 @@ const messageSchema = new mongoose.Schema({
 });
 
 const Message = mongoose.model('Message', messageSchema);
-export default Message;
+module.exports = Message;
