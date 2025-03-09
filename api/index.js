@@ -257,7 +257,13 @@ const messageSchema = new mongoose.Schema({
   },
   createdAt: {
     type: Date,
-    default: Date.now
+    default: Date.now,
+    validate: {
+    validator: function(v) {
+      return !isNaN(new Date(v).getTime());
+    },
+    message: props => `${props.value} is not a valid date!`
+  }
   },
   messageType: {
     type: String,
